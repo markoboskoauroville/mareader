@@ -11,7 +11,7 @@ real decoded waveform the way a caption tool does.
 Streamlit calls synth_sentences() to get, for a whole text, a list of clips with
 per word timings ready to hand to the karaoke player.
 """
-import os, re, json, time, shutil, asyncio
+import os, re, json, time, shutil, asyncio, random
 import subprocess, unicodedata, urllib.request, urllib.error, urllib.parse
 
 # ---------- languages & voices ----------
@@ -580,13 +580,28 @@ def _run_async(coro):
         return asyncio.run(coro)
 
 
-def synth_one(text, voice):
-    """Speak one sentence. Returns (mp3_bytes, tokens, total_seconds, engine)
-    or (None, None, 0, error_string)."""
-    try:
-        import edge_tts
-    except Exception:
-        return None, None, 0.0, "edge-tts not installed"
+# edge-tts talks to Microsoft's free public endpoint. On shared cloud IPs that
+# can transiently 403 (rate limit), reset, or hand back empty audio. These are
+# not permanent failures, so we retry a few times with exponential backoff and
+# jitter before giving up. RETRIES and RETRY_BASE can be tuned by the caller.
+RETRIES = 4
+RETRY_BASE = 0.8      # seconds; delay is RETRY_BASE * 2**attempt plus jitter
+RETRY_CAP = 8.0       # never wait longer than this between attempts
+
+
+def _is_transient(msg):
+    m = (msg or "").lower()
+    for sign in ("403", "429", "timeout", "timed out", "temporarily",
+                 "reset", "connection", "unavailable", "handshake",
+                 "no audio", "empty", "eof", "closed", "ssl"):
+        if sign in m:
+            return True
+    return False
+
+
+def _edge_stream(text, voice):
+    """One attempt at the network call. Returns (mp3_bytes, bounds, error)."""
+    import edge_tts
 
     async def go():
         bounds = []
@@ -603,9 +618,40 @@ def synth_one(text, voice):
     try:
         mp3_bytes, bounds = _run_async(go())
     except Exception as e:
-        return None, None, 0.0, "TTS failed: %s" % e
+        return None, None, "TTS failed: %s" % e
     if not mp3_bytes:
-        return None, None, 0.0, "no audio"
+        return None, None, "no audio"
+    return mp3_bytes, bounds, ""
+
+
+def synth_one(text, voice, retries=None):
+    """Speak one sentence, retrying transient network failures with exponential
+    backoff. Returns (mp3_bytes, tokens, total_seconds, engine) or
+    (None, None, 0, error_string)."""
+    try:
+        import edge_tts  # noqa: F401
+    except Exception:
+        return None, None, 0.0, "edge-tts not installed"
+
+    attempts = RETRIES if retries is None else max(1, retries)
+    mp3_bytes, bounds, err = None, None, "no audio"
+    for attempt in range(attempts):
+        mp3_bytes, bounds, err = _edge_stream(text, voice)
+        if not err:
+            break
+        # a permanent error (bad voice, malformed) will not improve on retry
+        if not _is_transient(err) or attempt == attempts - 1:
+            break
+        delay = min(RETRY_CAP, RETRY_BASE * (2 ** attempt))
+        delay += random.uniform(0, delay * 0.5)   # jitter to de-sync callers
+        time.sleep(delay)
+
+    if err or not mp3_bytes:
+        note = err or "no audio"
+        if _is_transient(note):
+            note += " (retried %d times; the voice service may be rate " \
+                    "limiting this server, try again shortly)" % attempts
+        return None, None, 0.0, note
 
     total = 0.0
     for bnd in bounds:

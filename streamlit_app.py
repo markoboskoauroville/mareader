@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v1 (a)
+EdgeReader  v2 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
@@ -19,10 +19,10 @@ import zipfile
 import streamlit as st
 
 import engine
-from karaoke import build_player
+from karaoke import build_player, FONT_CHOICES, FONT_KEYS
 
 APP_NAME = "EdgeReader"
-APP_VER = "v1 (a)"
+APP_VER = "v2 (a)"
 
 st.set_page_config(page_title=APP_NAME, page_icon="\U0001F525", layout="centered")
 
@@ -206,9 +206,12 @@ with st.sidebar:
         S.theme = st.radio("Theme", ["night", "sepia", "day"],
                            index=["night", "sepia", "day"].index(S.theme),
                            horizontal=True)
-        S.font = st.selectbox(
-            "Font", ["serif", "sans", "book", "mono", "dyslexic"],
-            index=["serif", "sans", "book", "mono", "dyslexic"].index(S.font))
+        if S.font not in FONT_KEYS:
+            S.font = "serif"
+        font_labels = [lbl for _, lbl in FONT_CHOICES]
+        fsel = st.selectbox("Font", font_labels,
+                            index=FONT_KEYS.index(S.font))
+        S.font = FONT_KEYS[font_labels.index(fsel)]
         S.size = st.slider("Text size", 14, 40, S.size)
         S.lineheight = st.slider("Line spacing", 1, 5, S.lineheight)
         S.focus = st.checkbox("Focus mode (dim other sentences)", S.focus)
@@ -222,12 +225,13 @@ with st.sidebar:
         S.loop = st.checkbox("Loop", S.loop)
         S.autoplay = st.checkbox("Auto-play on open", S.autoplay)
 
-    with st.expander("Word highlight colours", expanded=False):
+    with st.expander("Highlight colours (R G B)", expanded=True):
         S.wordhl = st.checkbox("Highlight the word being read", S.wordhl)
+        st.caption("Type each channel 0 to 255, as in the original reader.")
 
         def rgb_row(label, key):
             st.caption(label)
-            c = st.columns(3)
+            c = st.columns([1, 1, 1, 1])
             v = S[key]
             r = c[0].number_input("R", 0, 255, v[0], key=key + "_r",
                                   label_visibility="collapsed")
@@ -235,14 +239,28 @@ with st.sidebar:
                                   label_visibility="collapsed")
             b = c[2].number_input("B", 0, 255, v[2], key=key + "_b",
                                   label_visibility="collapsed")
+            c[3].markdown(
+                "<div style='height:34px;border-radius:6px;border:1px solid "
+                "#1d2230;background:rgb(%d,%d,%d)'></div>" % (r, g, b),
+                unsafe_allow_html=True)
             S[key] = [int(r), int(g), int(b)]
-            st.markdown(
-                "<div style='height:14px;border-radius:4px;background:rgb(%d,%d,%d)'></div>"
-                % (r, g, b), unsafe_allow_html=True)
 
         rgb_row("Sentence highlight background", "sent_rgb")
         rgb_row("Word highlight background", "word_rgb")
-        rgb_row("Highlighted word font colour", "font_rgb")
+        rgb_row("Highlighted word text colour", "font_rgb")
+
+        # live sample: a highlighted word inside a highlighted sentence
+        sb = S.sent_rgb
+        wb = S.word_rgb
+        wf = S.font_rgb
+        sent_fg = "#12140a" if (sb[0] * 299 + sb[1] * 587 + sb[2] * 114) / 1000 > 140 else "#ffffff"
+        st.markdown(
+            "<div style='margin-top:8px;font-size:15px'>Sample: "
+            "<span style='background:rgb(%d,%d,%d);color:%s;padding:2px 6px;border-radius:6px'>"
+            "the <span style='background:rgb(%d,%d,%d);color:rgb(%d,%d,%d);padding:1px 4px;border-radius:4px'>word</span>"
+            " being read</span></div>"
+            % (sb[0], sb[1], sb[2], sent_fg, wb[0], wb[1], wb[2], wf[0], wf[1], wf[2]),
+            unsafe_allow_html=True)
 
         S.offset_ms = st.slider(
             "Timing nudge (ms) \u00b7 later \u2192 earlier", -300, 300,
@@ -458,10 +476,20 @@ with tab_help:
         "Texts you save live in your browser session while the app is open. To "
         "keep one permanently, export it. With a Gemini key you can add an AI "
         "title and one line summary to archived texts.")
+    st.markdown("### The player")
+    st.markdown(
+        "The progress bar runs across the whole text, not one sentence, and you "
+        "can drag it to seek anywhere. Beside it the time shows elapsed and "
+        "total for the whole text, and a page counter shows the current "
+        "sentence over the total. The fullscreen button opens an ebook mode "
+        "where every control disappears and only the reading remains; a tap "
+        "brings back a faint pause and exit, and Escape leaves it.")
     st.markdown("### Reading comfort")
     st.markdown(
-        "Three themes (night, sepia, day), five fonts including a dyslexia "
-        "friendly option, adjustable text size and line spacing, a focus mode "
-        "that dims the sentences you are not reading, and full control over the "
-        "sentence highlight, word highlight, and word font colours.")
+        "Three themes (night, sepia, day), ten fonts including Lora, Garamond, "
+        "Merriweather, Roboto Slab, Nunito, and the legible Atkinson "
+        "Hyperlegible, adjustable text size and line spacing, a focus mode that "
+        "dims the sentences you are not reading, and full R G B control over "
+        "the sentence highlight background, the word highlight background, and "
+        "the highlighted word's text colour, with a live sample.")
     st.caption("%s %s \u00b7 ported from MA Reader Web" % (APP_NAME, APP_VER))
