@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v16 (a)
+EdgeReader  v17 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
@@ -28,9 +28,9 @@ import engine
 from karaoke import build_player, FONT_CHOICES, FONT_KEYS, DEFAULT_FONT
 
 APP_NAME = "EdgeReader"
-APP_VER = "v16 (a)"
+APP_VER = "v17 (a)"
 
-VIEW_OPTS = ["Reading", "Transcribe & Translate", "History"]
+VIEW_OPTS = ["Read", "Translate", "History", "Player"]
 READ_PH = "Paste or type text to read..."
 TRANS_PH = "Transcript appears here, and is editable..."
 TRANSL_PH = "Translation appears here, and is editable..."
@@ -57,6 +57,9 @@ st.markdown(
       .stButton>button { background:#11141d; color:#cdd0d6; border:1px solid #1d2230; }
       .stButton>button:hover { border-color:#7d5cff; color:#fff; }
       .stDownloadButton>button { background:#11141d; color:#cdd0d6; border:1px solid #1d2230; }
+      .stDownloadButton>button { background:transparent; color:#7d5cff;
+            border:none; text-decoration:underline; box-shadow:none; padding:2px 4px; }
+      .stDownloadButton>button:hover { color:#a58bff; background:transparent; }
       .muted { color:#7c8294; font-size:13px; }
     </style>
     <div class="ev">%s</div>
@@ -205,6 +208,8 @@ def _init():
     s.setdefault("gemini_key", "")
     s.setdefault("clips", None)
     s.setdefault("clips_voice_name", "")
+    s.setdefault("pending", None)
+    s.setdefault("stitched_bytes", None)
     s.setdefault("clips_title", "")
     s.setdefault("archive", [])
     s.setdefault("offline_sig", "")
@@ -239,9 +244,9 @@ def _init():
     d("sent_rgb", [255, 217, 59])
     d("word_rgb", [226, 59, 78])
     d("font_rgb", [255, 255, 255])
-    d("viewsel", "Reading")
+    d("viewsel", "Read")
     if s.get("viewsel") not in VIEW_OPTS:
-        s["viewsel"] = "Reading"
+        s["viewsel"] = "Read"
 
     # validate anything a stale or hand edited cookie could get wrong
     if s.theme not in ("night", "sepia", "day"):
@@ -500,36 +505,57 @@ def remember_text(text):
     return title
 
 
-def synth_voice(text, voice_edge):
-    """Synthesise text with a specific voice (used to speak translations).
-    Returns (clips, error)."""
-    clean = engine.clean_text(text)
-    if not clean.strip():
-        return None, "Nothing to speak."
-    return synthesize(clean, voice_edge)
-
-
-def read_text(text, remember=False):
-    """Synthesise `text` in the chosen reading language and voice, switch to the
-    Reading tab, and file it into history when remember is set. Returns an error
-    string, or '' on success."""
-    clean = engine.clean_text(text)
-    if not clean.strip():
-        return "Paste some text first."
-    voice, name = reading_voice(clean)
-    clips, err = synthesize(clean, voice)
-    if err or not clips:
-        return err or "Nothing was produced."
-    if remember:
-        with st.spinner("Titling..." if has_groq() else ""):
-            title = remember_text(text)
-    else:
-        title = title_from(text)
+def _set_clips(clips, name, title):
     S.clips = clips
     S.clips_voice_name = name
     S.clips_title = title
-    st.session_state["_pending_view"] = "Reading"
+    S.stitched_bytes = None          # export file rebuilt lazily for new audio
+
+
+def go_read(text, remember=False):
+    """Queue a read job and jump to the Player tab, where it generates with the
+    sentence progress shown and the player appears cleanly."""
+    if not engine.clean_text(text).strip():
+        return "Paste some text first."
+    S.pending = {"mode": "read", "text": text, "remember": remember}
+    st.session_state["_pending_view"] = "Player"
     return ""
+
+
+def go_speak(text, voice, name, title):
+    """Queue a speak job (a translation, in the target voice) and jump to Player."""
+    if not engine.clean_text(text).strip():
+        return "Nothing to speak."
+    S.pending = {"mode": "speak", "text": text, "voice": voice, "name": name,
+                 "title": title}
+    st.session_state["_pending_view"] = "Player"
+    return ""
+
+
+def run_pending():
+    """Executed on the Player tab: generate the queued audio with the progress
+    bar at the top, then hand the clips to the shared player."""
+    job = S.pending
+    S.pending = None
+    text = job.get("text", "")
+    clean = engine.clean_text(text)
+    if not clean.strip():
+        st.warning("Nothing to read.")
+        return
+    if job["mode"] == "read":
+        voice, name = reading_voice(clean)
+    else:
+        voice, name = job["voice"], job["name"]
+    clips, err = synthesize(clean, voice)
+    if err or not clips:
+        st.error(err or "Nothing was produced.")
+        return
+    if job["mode"] == "read" and job.get("remember"):
+        with st.spinner("Titling..." if has_groq() else ""):
+            title = remember_text(text)
+    else:
+        title = job.get("title") or title_from(text)
+    _set_clips(clips, name, title)
 
 
 def build_export_zip(clips, title, voice_name):
@@ -653,13 +679,6 @@ with st.sidebar:
 
     st.markdown("---")
 
-    if S.clips:
-        st.download_button(
-            "Export current reading (.zip)",
-            data=build_export_zip(S.clips, S.clips_title, S.get("clips_voice_name", "")),
-            file_name="%s.zip" % (S.clips_title or "edgereader"),
-            mime="application/zip", use_container_width=True)
-
     with st.expander("Offline file", expanded=False):
         st.caption("Play back an EdgeReader export .zip without re-generating.")
         up = st.file_uploader("Export .zip", type=["zip"],
@@ -672,8 +691,9 @@ with st.sidebar:
                     S.clips = clips
                     S.clips_voice_name = manifest.get("voice", "")
                     S.clips_title = manifest.get("title", "Offline")
+                    S.stitched_bytes = None
                     S.offline_sig = sig
-                    st.session_state["_pending_view"] = "Reading"
+                    st.session_state["_pending_view"] = "Player"
                     st.rerun()
                 except Exception as e:
                     st.error("Not an EdgeReader export: %s" % e)
@@ -732,40 +752,33 @@ xc.button("\u2715", help="Clear the text boxes and current audio, start again",
           on_click=_reset_all, use_container_width=True)
 
 hist_label = "History (%d)" % len(S.archive) if S.archive else "History"
-_tab_label = {"Reading": "Reading",
-              "Transcribe & Translate": "Transcribe & Translate",
-              "History": hist_label}
+_tab_label = {"Read": "Read", "Translate": "Translate", "History": hist_label,
+              "Player": "Player"}
 st.segmented_control("mode", VIEW_OPTS, key="viewsel", required=True,
                      width="stretch", label_visibility="collapsed",
                      format_func=lambda v: _tab_label.get(v, v))
-view = st.session_state.get("viewsel") or "Reading"
+view = st.session_state.get("viewsel") or "Read"
 
 st.write("")
 
-if view == "Reading":
+if view == "Read":
     lc, vc = st.columns(2)
     with lc:
         lang_radio("Language", "read_lang", include_auto=True)
     with vc:
         sex_radio("sex_read")
-    st.text_area("Reading text", key="pastebox", height=200,
+    st.text_area("Reading text", key="pastebox", height=220,
                  label_visibility="collapsed", placeholder=READ_PH)
     a, b = st.columns([2, 1])
     if a.button("Read", type="primary", use_container_width=True):
-        err = read_text(S.pastebox, remember=True)
+        err = go_read(S.pastebox, remember=True)
         if err:
             st.warning(err)
         else:
             st.rerun()
     b.button("Clear", use_container_width=True, on_click=_clear_paste)
-
-    if S.clips:
-        eng = S.clips[0].get("engine", "edge")
-        src = "waveform" if eng == "pcm" else "voice marks"
-        st.markdown("<span class='muted'>%d sentences \u00b7 %s \u00b7 timing: %s"
-                    "</span>" % (len(S.clips), S.get("clips_voice_name", ""), src),
-                    unsafe_allow_html=True)
-        st.iframe(build_player(S.clips, current_settings()), height=620)
+    st.markdown("<span class='muted'>Press Read to generate the audio and open "
+                "the Player.</span>", unsafe_allow_html=True)
 
 elif view == "History":
     st.markdown("<span class='muted'>Everything you read is collected here as "
@@ -799,13 +812,15 @@ elif view == "History":
         st.markdown("<span class='muted'>No history yet.</span>",
                     unsafe_allow_html=True)
     for m in list(S.archive):
-        with st.container(border=True):
-            st.markdown("**%s**  \n<span class='muted'>%d chars</span>"
-                        % (m["title"], m["chars"]), unsafe_allow_html=True)
+        with st.expander(m["title"] or "Untitled"):
+            st.text_area("text", value=m["text"], height=160,
+                         key="hx_%s" % m["id"], label_visibility="collapsed")
+            st.caption("Select the text above to copy it \u00b7 %d characters"
+                       % m["chars"])
             a, b, c = st.columns([2, 1, 1])
             if a.button("Read with TTS", key="rd_%s" % m["id"],
                         type="primary", use_container_width=True):
-                err = read_text(m["text"], remember=False)
+                err = go_read(m["text"], remember=False)
                 if err:
                     st.error(err)
                 else:
@@ -827,7 +842,7 @@ elif view == "History":
                 S.archive = [x for x in S.archive if x["id"] != m["id"]]
                 st.rerun()
 
-else:  # translate
+elif view == "Translate":
     LANGS_TO = {"hr": "Croatian", "en": "English", "de": "German"}
 
     st.markdown("<span class='muted'>Speak or upload audio. Transcribe it, "
@@ -910,12 +925,9 @@ else:  # translate
             st.warning("Nothing to speak yet.")
             return
         voice = engine.voice_for_lang(S.tr_to, S.voice_sex)
-        with st.spinner("Reading the %s translation aloud..." % LANGS_TO[S.tr_to]):
-            clips, err = synth_voice(text, voice)
-        if err or not clips:
-            st.error(err or "Could not speak this.")
-            return
-        S.tr_clips = clips
+        name = "%s %s" % (LANGS_TO[S.tr_to],
+                          "female" if S.voice_sex == "F" else "male")
+        go_speak(text, voice, name, "Translation to " + LANGS_TO[S.tr_to])
 
     b1, b2 = st.columns(2)
     if b1.button("Transcribe", use_container_width=True):
@@ -927,7 +939,7 @@ else:  # translate
         if t is not None:
             tl = do_translate(t)
             if tl is not None:
-                do_speak(tl)
+                do_speak(tl)          # queues audio and jumps to Player
         st.rerun()
 
     st.text_area("Transcript", key="tr_src", height=130, placeholder=TRANS_PH)
@@ -940,11 +952,31 @@ else:  # translate
         do_speak(st.session_state.get("tr_out") or st.session_state.get("tr_src", ""))
         st.rerun()
 
-    if S.tr_clips:
-        st.markdown("<span class='muted'>Translation, %d sentences, spoken in %s."
-                    "</span>" % (len(S.tr_clips), LANGS_TO[S.tr_to]),
+else:  # Player
+    if S.pending:
+        run_pending()
+
+    if S.clips:
+        eng = S.clips[0].get("engine", "edge")
+        src = "waveform" if eng == "pcm" else "voice marks"
+        head = S.clips_title or "Reading"
+        st.markdown("<span class='muted'>%s \u00b7 %d sentences \u00b7 %s \u00b7 "
+                    "timing: %s</span>"
+                    % (head, len(S.clips), S.get("clips_voice_name", ""), src),
                     unsafe_allow_html=True)
-        st.iframe(build_player(S.tr_clips, current_settings()), height=560)
+        st.iframe(build_player(S.clips, current_settings()), height=620)
+
+        if S.get("stitched_bytes") is None:
+            with st.spinner("Preparing the audio file..."):
+                S.stitched_bytes = engine.stitch_mp3(S.clips)
+        safe = "".join(ch if ch.isalnum() or ch in " -_" else "_"
+                       for ch in (S.clips_title or "edgereader"))[:50].strip() or "edgereader"
+        st.download_button("Export audio (.mp3)", data=S.stitched_bytes or b"",
+                           file_name=safe + ".mp3", mime="audio/mpeg")
+    else:
+        st.markdown("<span class='muted'>Nothing playing yet. Go to Read, add "
+                    "text, and press Read; the audio opens here.</span>",
+                    unsafe_allow_html=True)
 
 
 # ---------- persist settings and auth; clean up any legacy archive cookies ----------

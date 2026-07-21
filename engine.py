@@ -345,6 +345,40 @@ def ffmpeg_available():
     return bool(_FFMPEG)
 
 
+def stitch_mp3(clips):
+    """Join the per-sentence mp3s into one file for export. Uses ffmpeg's concat
+    copy (no re-encode) when available, else naive byte concatenation. Returns
+    mp3 bytes."""
+    parts = [c["mp3"] for c in clips if c.get("mp3")]
+    if not parts:
+        return b""
+    if len(parts) == 1:
+        return parts[0]
+    if not _FFMPEG:
+        return b"".join(parts)
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            files = []
+            for i, data in enumerate(parts):
+                p = os.path.join(d, "s%05d.mp3" % i)
+                with open(p, "wb") as f:
+                    f.write(data)
+                files.append(p)
+            listp = os.path.join(d, "list.txt")
+            with open(listp, "w") as f:
+                f.write("\n".join("file '%s'" % p for p in files))
+            outp = os.path.join(d, "out.mp3")
+            r = subprocess.run([_FFMPEG, "-v", "quiet", "-f", "concat", "-safe",
+                                "0", "-i", listp, "-c", "copy", outp], timeout=180)
+            if r.returncode == 0 and os.path.exists(outp):
+                with open(outp, "rb") as f:
+                    return f.read()
+    except Exception:
+        pass
+    return b"".join(parts)
+
+
 def _pcm_env_bytes(mp3_bytes):
     """Decode mp3 bytes to mono 8 kHz 16-bit via ffmpeg on stdin, return
     (frames, dur). frames is the RMS energy of every 10 ms window."""
