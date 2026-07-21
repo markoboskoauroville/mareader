@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v14 (a)
+EdgeReader  v15 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
@@ -28,7 +28,7 @@ import engine
 from karaoke import build_player, FONT_CHOICES, FONT_KEYS, DEFAULT_FONT
 
 APP_NAME = "EdgeReader"
-APP_VER = "v14 (a)"
+APP_VER = "v15 (a)"
 
 VIEW_OPTS = ["Reading", "Transcribe & Translate", "History"]
 READ_PH = "Paste or type text to read..."
@@ -132,8 +132,8 @@ require_password()
 # session on stateless Streamlit Cloud. The Gemini key is deliberately NOT saved,
 # since a cookie is readable on the device.
 PERSIST_KEYS = ["shown_langs", "read_lang", "voice_sex", "theme", "font", "size",
-                "lineheight", "scroll", "speed", "gap", "volume", "loop",
-                "autoplay", "focus", "wordhl", "offset_ms",
+                "lineheight", "scroll", "tap_mode", "speed", "gap", "volume",
+                "loop", "autoplay", "focus", "wordhl", "offset_ms",
                 "sent_rgb", "word_rgb", "font_rgb", "viewsel",
                 "tr_from", "tr_to", "tx_provider", "tl_provider"]
 COOKIE = "edgereader"
@@ -293,6 +293,7 @@ def _init():
     d("size", 21)
     d("lineheight", 3)
     d("scroll", "top")
+    d("tap_mode", "fullscreen")
     d("speed", 1.0)
     d("gap", 0.0)
     d("volume", 100)
@@ -315,6 +316,8 @@ def _init():
         s.font = DEFAULT_FONT
     if s.scroll not in ("top", "center", "off"):
         s.scroll = "top"
+    if s.get("tap_mode") not in ("fullscreen", "jump"):
+        s.tap_mode = "fullscreen"
     if s.speed not in SPEEDS:
         s.speed = 1.0
     if s.voice_sex not in ("F", "M"):
@@ -436,7 +439,8 @@ def sex_radio(widget_key):
 def current_settings():
     return {
         "theme": S.theme, "font": S.font, "size": S.size,
-        "lineheight": S.lineheight, "scroll": S.scroll, "speed": S.speed,
+        "lineheight": S.lineheight, "scroll": S.scroll, "tap": S.tap_mode,
+        "speed": S.speed,
         "gap": S.gap, "volume": S.volume, "loop": S.loop, "autoplay": S.autoplay,
         "focus": S.focus, "wordhl": S.wordhl, "offsetMs": S.offset_ms,
         "sentRGB": S.sent_rgb, "wordRGB": S.word_rgb, "fontRGB": S.font_rgb,
@@ -664,6 +668,12 @@ with st.sidebar:
         ssel = st.selectbox("Auto-scroll", [scroll_opts[k] for k in skeys],
                             index=skeys.index(S.scroll))
         S.scroll = skeys[[scroll_opts[k] for k in skeys].index(ssel)]
+        tap_opts = {"fullscreen": "Tap text: enter/exit fullscreen",
+                    "jump": "Tap text: jump to that sentence"}
+        tkeys = list(tap_opts.keys())
+        tsel = st.selectbox("Tap behaviour", [tap_opts[k] for k in tkeys],
+                            index=tkeys.index(S.get("tap_mode", "fullscreen")))
+        S.tap_mode = tkeys[[tap_opts[k] for k in tkeys].index(tsel)]
         S.focus = st.checkbox("Focus mode (dim other sentences)", S.focus)
 
     with st.expander("Playback", expanded=False):

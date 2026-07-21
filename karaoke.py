@@ -149,9 +149,10 @@ html,body{margin:0}
 /* fullscreen ebook mode: controls gone, faint tap reveal */
 #wrap.fullread .controls{ display:none; }
 #wrap.fullread .doc{ padding:34px max(20px, 7vw) 44px; }
-.fsui{position:absolute; z-index:10; opacity:0; transition:opacity .3s;
+.fsui{position:absolute; z-index:10; opacity:0; transition:opacity .25s;
   pointer-events:none}
-#wrap.fullread .fsui.show{opacity:1; pointer-events:auto}
+#wrap.fullread .fsui{opacity:.45; pointer-events:auto}
+#wrap.fullread .fsui:hover, #wrap.fullread .fsui:active{opacity:1}
 .fsexit{top:14px; right:16px; width:42px; height:42px; border-radius:50%;
   border:none; background:rgba(128,128,128,.18); color:var(--text);
   font-size:20px; line-height:1; backdrop-filter:blur(4px); cursor:pointer}
@@ -197,7 +198,7 @@ html,body{margin:0}
 "use strict";
 const CLIPS = __DATA__;
 const S = Object.assign({
-  theme:"night", font:"sans", size:21, lineheight:3, scroll:"top",
+  theme:"night", font:"sans", size:21, lineheight:3, scroll:"top", tap:"fullscreen",
   sentRGB:[255,217,59], wordRGB:[226,59,78], fontRGB:[255,255,255],
   speed:1.0, gap:0.0, loop:false, autoplay:false, focus:false,
   wordhl:true, offsetMs:0, volume:100
@@ -255,7 +256,6 @@ function render(){
   CLIPS.forEach((c,i)=>{
     const p=document.createElement("span");
     p.className="sent"; p.dataset.i=i; p.innerHTML=c.html+" ";
-    p.addEventListener("click",(e)=>{ e.stopPropagation(); load(i,true); });
     doc.appendChild(p);
   });
 }
@@ -376,25 +376,29 @@ function enterFS(){ const el=wrap;
 function exitFS(){
   (document.exitFullscreen||document.webkitExitFullscreen||document.msExitFullscreen||function(){}).call(document); }
 function isFS(){ return document.fullscreenElement||document.webkitFullscreenElement; }
-document.getElementById("fsB").addEventListener("click",()=>{ isFS()?exitFS():enterFS(); });
-document.getElementById("fsExit").addEventListener("click",exitFS);
-document.getElementById("fsPlay").addEventListener("click",(e)=>{ e.stopPropagation(); playPause(); nudge(); });
+function toggleFS(){ isFS()?exitFS():enterFS(); }
+document.getElementById("fsB").addEventListener("click",()=>{ toggleFS(); });
+document.getElementById("fsExit").addEventListener("click",(e)=>{ e.stopPropagation(); exitFS(); });
+document.getElementById("fsPlay").addEventListener("click",(e)=>{ e.stopPropagation(); playPause(); });
 function onFSChange(){
   const on=!!isFS();
   wrap.classList.toggle("fullread",on);
   document.getElementById("fsB").classList.toggle("on",on);
-  if(on) nudge(); else fsShow(false);
 }
 document.addEventListener("fullscreenchange",onFSChange);
 document.addEventListener("webkitfullscreenchange",onFSChange);
 
-let fadeTimer=null;
-function fsShow(v){ document.querySelectorAll(".fsui").forEach(e=>e.classList.toggle("show",v)); }
-function nudge(){ if(!isFS()) return; fsShow(true);
-  if(fadeTimer) clearTimeout(fadeTimer); fadeTimer=setTimeout(()=>fsShow(false),2600); }
-doc.addEventListener("mousemove",nudge);
-doc.addEventListener("touchstart",nudge,{passive:true});
-doc.addEventListener("click",()=>{ if(isFS()) nudge(); });
+/* tap on the reading text: either jump to that sentence, or toggle fullscreen
+   (reading keeps playing either way). Set in Settings, default fullscreen. */
+doc.addEventListener("click",function(e){
+  if(e.target.closest && e.target.closest(".fsui")) return;
+  if(S.tap==="jump"){
+    var sent=e.target.closest?e.target.closest(".sent"):null;
+    if(sent && sent.dataset.i!==undefined) load(parseInt(sent.dataset.i,10),true);
+  } else {
+    toggleFS();
+  }
+});
 
 applyLook();
 render();
