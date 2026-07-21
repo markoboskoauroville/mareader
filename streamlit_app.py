@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v8 (a)
+EdgeReader  v9 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
@@ -27,7 +27,7 @@ import engine
 from karaoke import build_player, FONT_CHOICES, FONT_KEYS, DEFAULT_FONT
 
 APP_NAME = "EdgeReader"
-APP_VER = "v8 (a)"
+APP_VER = "v9 (a)"
 
 st.set_page_config(page_title=APP_NAME, page_icon="\U0001F4D6",
                    layout="centered", initial_sidebar_state="collapsed")
@@ -57,6 +57,41 @@ st.markdown(
     """ % APP_VER,
     unsafe_allow_html=True,
 )
+
+
+# ---------- password gate ----------
+# The password comes from secrets (app_password) and defaults to "kerstin" when
+# not set. Leave it blank in secrets to turn protection off.
+def _app_password():
+    try:
+        pw = st.secrets.get("app_password", "kerstin")
+    except Exception:
+        pw = "kerstin"
+    return "" if pw is None else str(pw)
+
+
+def require_password():
+    pw = _app_password()
+    if not pw or st.session_state.get("_auth_ok"):
+        return
+    st.markdown("<div style='max-width:340px;margin:14vh auto 0'>",
+                unsafe_allow_html=True)
+    st.markdown("#### \U0001F512 EdgeReader")
+    st.caption("Password protected. Enter the password to continue.")
+    entered = st.text_input("Password", type="password", key="_pw",
+                            label_visibility="collapsed", placeholder="Password")
+    st.button("Enter", type="primary", use_container_width=True)
+    if entered:
+        if entered == pw:
+            st.session_state["_auth_ok"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password. Try again.")
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
+
+
+require_password()
 
 
 # ---------- settings persistence (first party cookie) ----------
