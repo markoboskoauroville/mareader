@@ -769,3 +769,292 @@ def gemini_title_summary(text, key):
             last_err = "Gemini request failed: %s" % e
             continue
     return None, last_err
+
+
+# ---------- Groq: title a whole text, rotating across keys and models ----------
+# Groq is OpenAI compatible. The Llama chat models were retired in mid 2026, so
+# these default to the OpenAI open models and Kimi K2 that Groq hosts now, with
+# a fallback chain so a further deprecation of any one model is survived.
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b",
+               "moonshotai/kimi-k2-instruct", "llama-3.3-70b-versatile"]
+
+
+def _clean_title(t):
+    t = (t or "").strip().strip('"').strip("'").strip()
+    if t.lower().startswith("title:"):
+        t = t[6:].strip()
+    t = " ".join(t.split())
+    return t.rstrip(".").strip()[:80]
+
+
+def groq_title(text, keys, start=0):
+    """Summarise a whole text into one short title. Tries each key in a rotated
+    order (to spread rate limits across the five keys) and each model in turn.
+    Returns (title, error)."""
+    keys = [k for k in keys if isinstance(k, str) and k.strip()]
+    if not keys:
+        return None, "No Groq keys provided."
+    snippet = text.strip()[:6000]
+    sys_msg = "You write concise, descriptive titles for reading material."
+    user_msg = ("Give a short title, at most 8 words, that captures what this "
+                "text is about. Return only the title as plain text, with no "
+                "surrounding quotes and no trailing period.\n\nText:\n" + snippet)
+    n = len(keys)
+    order = [keys[(start + i) % n] for i in range(n)]
+    last = "Groq could not produce a title."
+    for key in order:
+        advanced_key = False
+        for model in GROQ_MODELS:
+            payload = {"model": model, "temperature": 0.3, "max_tokens": 40,
+                       "messages": [{"role": "system", "content": sys_msg},
+                                    {"role": "user", "content": user_msg}]}
+            req = urllib.request.Request(
+                GROQ_ENDPOINT, data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + key.strip()}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    obj = json.loads(r.read().decode("utf-8", "replace"))
+                txt = obj["choices"][0]["message"]["content"]
+                title = _clean_title(txt)
+                if title:
+                    return title, ""
+                last = "%s returned an empty title." % model
+            except urllib.error.HTTPError as e:
+                code = e.code
+                if code in (401, 403):
+                    last = "A Groq key was rejected."
+                    advanced_key = True
+                    break            # try the next key
+                if code == 429:
+                    last = "Groq rate limit hit."
+                    advanced_key = True
+                    break            # rotate to the next key
+                if code in (400, 404):
+                    last = "Model %s unavailable on Groq." % model
+                    continue         # try the next model on the same key
+                last = "Groq error %s." % code
+                continue
+            except Exception as e:
+                last = "Groq request failed: %s" % e
+                continue
+        if not advanced_key:
+            # every model failed for reasons other than key/rate; next key anyway
+            continue
+    return None, last
+
+
+# ---------- language helpers shared by transcription and translation ----------
+LANG_NAMES = {"hr": "Croatian", "en": "English", "de": "German",
+              "auto": "the detected source language"}
+
+
+def lang_name(code):
+    return LANG_NAMES.get(code, code)
+
+
+def voice_for_lang(lang, sex="F"):
+    """Pick an edge voice id for a target language, so a translation can be
+    spoken in the language it was translated into."""
+    lg = LANG_BY_KEY.get(lang) or LANG_BY_KEY.get("en")
+    edge, _ = lg["female"] if sex == "F" else lg["male"]
+    return edge
+
+
+# ---------- multipart helper (no requests dependency) ----------
+def _multipart(fields, filename, filedata, field="file",
+               content_type="application/octet-stream"):
+    boundary = "EdgeReaderB" + os.urandom(10).hex()
+    body = bytearray()
+    for k, v in fields.items():
+        body += ("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                 % (boundary, k, v)).encode("utf-8")
+    body += ("--%s\r\nContent-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\n"
+             "Content-Type: %s\r\n\r\n" % (boundary, field, filename, content_type)).encode("utf-8")
+    body += filedata + ("\r\n--%s--\r\n" % boundary).encode("utf-8")
+    return bytes(body), "multipart/form-data; boundary=" + boundary
+
+
+# ---------- transcription: Groq Whisper (free) ----------
+GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+WHISPER_MODEL = "whisper-large-v3"
+
+
+def groq_transcribe(audio, filename, keys, language=None):
+    """Transcribe audio bytes with Groq Whisper, rotating keys. language may be
+    hr, en, de or None (auto). Returns (text, error)."""
+    keys = [k for k in keys if isinstance(k, str) and k.strip()]
+    if not keys:
+        return None, "No Groq keys for Whisper."
+    errs = []
+    for i, key in enumerate(keys):
+        fields = {"model": WHISPER_MODEL, "response_format": "json"}
+        if language in ("hr", "en", "de"):
+            fields["language"] = language
+        body, ctype = _multipart(fields, filename or "audio.wav", audio)
+        req = urllib.request.Request(
+            GROQ_TRANSCRIBE_URL, data=body, method="POST",
+            headers={"Authorization": "Bearer " + key.strip(), "Content-Type": ctype})
+        try:
+            with urllib.request.urlopen(req, timeout=180) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+            return (data.get("text") or "").strip(), ""
+        except urllib.error.HTTPError as e:
+            msg = "HTTP %s" % e.code
+            try:
+                j = json.loads(e.read().decode("utf-8", "replace"))
+                msg += ": " + j.get("error", {}).get("message", "")
+            except Exception:
+                pass
+            errs.append("key %d %s" % (i + 1, msg))
+        except Exception as e:
+            errs.append("key %d %s" % (i + 1, e))
+    return None, "Every Groq key failed. " + " | ".join(errs)
+
+
+# ---------- transcription: AssemblyAI (paid) ----------
+AAI_BASE = "https://api.assemblyai.com"
+AAI_MODELS = ["universal-3-pro", "universal-2"]
+
+
+def assemblyai_transcribe(audio, keys, language=None, poll_max=60, poll_sleep=3):
+    """Transcribe audio bytes with AssemblyAI: upload, create, poll. Rotates
+    keys. Returns (text, error)."""
+    keys = [k for k in keys if isinstance(k, str) and k.strip()]
+    if not keys:
+        return None, "No AssemblyAI keys."
+    errs = []
+    for i, key in enumerate(keys):
+        key = key.strip()
+        try:
+            up = urllib.request.Request(
+                AAI_BASE + "/v2/upload", data=audio, method="POST",
+                headers={"authorization": key, "content-type": "application/octet-stream"})
+            with urllib.request.urlopen(up, timeout=300) as r:
+                upload_url = json.loads(r.read().decode("utf-8", "replace"))["upload_url"]
+
+            body = {"audio_url": upload_url, "speech_models": AAI_MODELS}
+            if language in ("hr", "en", "de"):
+                body["language_code"] = language
+            else:
+                body["language_detection"] = True
+            tr = urllib.request.Request(
+                AAI_BASE + "/v2/transcript", data=json.dumps(body).encode("utf-8"),
+                method="POST",
+                headers={"authorization": key, "content-type": "application/json"})
+            with urllib.request.urlopen(tr, timeout=60) as r:
+                tid = json.loads(r.read().decode("utf-8", "replace"))["id"]
+
+            for _ in range(poll_max):
+                time.sleep(poll_sleep)
+                pr = urllib.request.Request(AAI_BASE + "/v2/transcript/" + tid,
+                                            headers={"authorization": key})
+                with urllib.request.urlopen(pr, timeout=60) as r:
+                    d = json.loads(r.read().decode("utf-8", "replace"))
+                if d.get("status") == "completed":
+                    return (d.get("text") or "").strip(), ""
+                if d.get("status") == "error":
+                    raise RuntimeError(d.get("error", "transcription failed"))
+            raise TimeoutError("timeout, audio may be too long")
+        except urllib.error.HTTPError as e:
+            errs.append("key %d HTTP %s" % (i + 1, e.code))
+        except Exception as e:
+            errs.append("key %d %s" % (i + 1, e))
+    return None, "Every AssemblyAI key failed. " + " | ".join(errs)
+
+
+def transcribe(audio, filename, provider, groq_keys, aai_keys, language=None):
+    if provider == "assemblyai":
+        return assemblyai_transcribe(audio, aai_keys, language=language)
+    return groq_transcribe(audio, filename, groq_keys, language=language)
+
+
+# ---------- translation: Groq (free) or Google Gemini (paid) ----------
+def _translate_prompt(text, src, tgt):
+    return ("Translate the following text from %s to %s. Return only the "
+            "translation, with no notes and no quotes, and keep it natural.\n\n%s"
+            % (lang_name(src), lang_name(tgt), text[:60000]))
+
+
+def groq_translate(text, src, tgt, keys, start=0):
+    keys = [k for k in keys if isinstance(k, str) and k.strip()]
+    if not keys:
+        return None, "No Groq keys."
+    prompt = _translate_prompt(text, src, tgt)
+    n = len(keys)
+    order = [keys[(start + i) % n] for i in range(n)]
+    last = "Groq translation failed."
+    for key in order:
+        for model in GROQ_MODELS:
+            payload = {"model": model, "temperature": 0.2, "max_tokens": 2000,
+                       "messages": [{"role": "user", "content": prompt}]}
+            req = urllib.request.Request(
+                GROQ_ENDPOINT, data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + key.strip()}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    obj = json.loads(r.read().decode("utf-8", "replace"))
+                out = obj["choices"][0]["message"]["content"].strip().strip('"').strip()
+                if out:
+                    return out, ""
+                last = "%s returned nothing." % model
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403, 429):
+                    last = "Groq key rejected or rate limited."
+                    break
+                last = "Groq error %s." % e.code
+                continue
+            except Exception as e:
+                last = "Groq request failed: %s" % e
+                continue
+    return None, last
+
+
+def gemini_translate(text, src, tgt, keys, start=0):
+    keys = [k for k in keys if isinstance(k, str) and k.strip()]
+    if not keys:
+        return None, "No Google keys."
+    prompt = _translate_prompt(text, src, tgt)
+    n = len(keys)
+    order = [keys[(start + i) % n] for i in range(n)]
+    last = "Google translation failed."
+    for key in order:
+        for model in GEMINI_MODELS:
+            url = GEMINI_ENDPOINT % model
+            payload = {"contents": [{"parts": [{"text": prompt}]}],
+                       "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}}
+            req = urllib.request.Request(
+                url, data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "x-goog-api-key": key.strip()}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    obj = json.loads(r.read().decode("utf-8", "replace"))
+                txt = ""
+                for cand in obj.get("candidates", []):
+                    for part in cand.get("content", {}).get("parts", []):
+                        txt += part.get("text", "")
+                txt = txt.strip().strip('"').strip()
+                if txt:
+                    return txt, ""
+                last = "%s returned nothing." % model
+            except urllib.error.HTTPError as e:
+                if e.code in (400, 401, 403, 429):
+                    last = "Google key rejected or rate limited."
+                    break
+                last = "Google error %s." % e.code
+                continue
+            except Exception as e:
+                last = "Google request failed: %s" % e
+                continue
+    return None, last
+
+
+def translate_text(text, src, tgt, provider, groq_keys, google_keys, start=0):
+    if not text.strip():
+        return None, "Nothing to translate."
+    if provider == "google":
+        return gemini_translate(text, src, tgt, google_keys, start=start)
+    return groq_translate(text, src, tgt, groq_keys, start=start)

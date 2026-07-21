@@ -2,40 +2,44 @@
 """
 EdgeReader karaoke player.
 
-Builds the self contained HTML/JS reader that Streamlit embeds. It receives, for
-one text, every sentence's clip (audio as a data URI) plus per word timings, and
-plays them one sentence at a time while sweeping the highlight word by word.
+A self contained HTML/JS reader that Streamlit embeds. It receives, for one text,
+every sentence's clip (audio as a data URI) plus per word timings, and plays them
+one sentence at a time while sweeping the highlight word by word.
 
-The smooth motion comes from the same drift corrected media clock MA Reader used:
-mobile <audio> only reports currentTime a few times a second, so between native
-ticks the clock free runs on wall time times the playback rate, and eases toward
-each fresh currentTime. That keeps the highlighted word glued to the voice.
+Layout: the transport sits at the TOP so it stays in reach on long texts, and the
+reading area fills the space below it and scrolls on its own. Smooth motion comes
+from a drift corrected media clock: between the sparse native currentTime ticks it
+free runs on wall time times the playback rate, then eases toward each fresh tick,
+so the highlighted word stays glued to the voice.
 
-The transport shows progress across the WHOLE text (all clips joined), the
-elapsed and total time of the whole text, and a page counter, current sentence
-slash total. A fullscreen button opens an ebook mode where every control is gone
-and only the reading remains; a tap reveals a faint pause and exit.
+The transport shows progress across the WHOLE text (all clips joined), elapsed and
+total time, and a page counter (current sentence over total). Auto scroll can pin
+the current sentence to the top of the reading area so the eye rests on one spot.
+A fullscreen button opens an ebook mode where the controls vanish and only the
+reading remains.
 """
 import json
 import base64
 import html as _html
 
-# Font families offered in Settings. Web fonts are pulled from Google Fonts in
-# the component so every choice renders the same on any machine, including the
-# Linux servers Streamlit Cloud runs on. Keys must match FONTS in the template.
+# Fonts offered in Settings, sans serif first (easier to read) then serifs, mono
+# last. Web fonts load from Google Fonts inside the component so every choice
+# renders the same on any machine, including Streamlit Cloud's Linux servers.
 FONT_CHOICES = [
+    ("sans",     "Sans (system)"),
+    ("source",   "Source Sans"),
+    ("nunito",   "Nunito (rounded)"),
+    ("legible",  "Legible (Atkinson Hyperlegible)"),
+    ("inter",    "Inter"),
     ("serif",    "Serif (Georgia)"),
     ("book",     "Book (Lora)"),
     ("garamond", "Garamond"),
     ("merri",    "Merriweather"),
     ("slab",     "Slab serif (Roboto Slab)"),
-    ("sans",     "Sans (system)"),
-    ("source",   "Source Sans"),
-    ("nunito",   "Nunito (rounded)"),
     ("mono",     "Monospace"),
-    ("legible",  "Legible (Atkinson Hyperlegible)"),
 ]
 FONT_KEYS = [k for k, _ in FONT_CHOICES]
+DEFAULT_FONT = "sans"
 
 
 def _sentence_html(text, words):
@@ -70,14 +74,9 @@ def build_player(clips, settings, title=""):
             "audio": "data:audio/mpeg;base64," + b64,
             "dur": float(c.get("dur", 0.0)),
         })
-
     data = json.dumps(payload)
     st = json.dumps(settings)
-    ttl = _html.escape(title or "")
-
-    return TEMPLATE.replace("__DATA__", data)\
-                   .replace("__SETTINGS__", st)\
-                   .replace("__TITLE__", ttl)
+    return TEMPLATE.replace("__DATA__", data).replace("__SETTINGS__", st)
 
 
 TEMPLATE = r"""
@@ -87,7 +86,7 @@ TEMPLATE = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=EB+Garamond:wght@400;500&family=Lora:wght@400;600&family=Merriweather:wght@400;700&family=Nunito:wght@400;700&family=Roboto+Slab:wght@400;600&family=Source+Sans+3:wght@400;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=EB+Garamond:wght@400;500&family=Inter:wght@400;600&family=Lora:wght@400;600&family=Merriweather:wght@400;700&family=Nunito:wght@400;700&family=Roboto+Slab:wght@400;600&family=Source+Sans+3:wght@400;600&display=swap');
 :root{ --screen:#4696e6; --play:#37c878; }
 *{box-sizing:border-box}
 html,body{margin:0}
@@ -113,43 +112,43 @@ html,body{margin:0}
   display:flex; flex-direction:column; height:600px; position:relative;
 }
 #wrap:fullscreen, #wrap:-webkit-full-screen{ height:100vh; border-radius:0; border:none; }
-.rtitle{padding:12px 16px 0; color:var(--faint); font-size:12px;
-  letter-spacing:.14em; text-transform:uppercase}
-.doc{flex:1; overflow-y:auto; padding:14px 18px 22px; background:var(--page);
-  color:var(--page-text); line-height:var(--lh,1.72);
-  font-size:var(--fs,21px); font-family:var(--rf,Georgia,serif);
-  -webkit-overflow-scrolling:touch}
-.sent{border-radius:8px; padding:1px 2px; transition:background .12s,color .12s;
-  cursor:pointer}
-.sent.active{background:var(--sentbg); color:var(--sentfg)}
-#wrap.focus .sent:not(.active){opacity:.30}
-.sent .w{border-radius:4px; padding:0 1px}
-.sent.active .w.cur{background:var(--wordbg); color:var(--wordfg);
-  -webkit-box-decoration-break:clone; box-decoration-break:clone}
 
-.controls{border-top:1px solid var(--line); background:var(--bg);
-  padding:10px 14px 14px}
+/* transport on top */
+.controls{border-bottom:1px solid var(--line); background:var(--bg);
+  padding:12px 14px 12px}
 .bar{display:flex; align-items:center; justify-content:center; gap:20px}
 .tb{border:none; background:transparent; color:var(--text); padding:0;
   display:flex; align-items:center; justify-content:center; cursor:pointer}
 .tb svg{display:block}
-.tb.skip{width:46px; height:46px; opacity:.85}
-.tb.skip svg{width:27px; height:27px}
-.tb.play{width:58px; height:58px}
-.tb.play svg{width:40px; height:40px}
-.tb.side{width:44px; height:44px; color:var(--dim); font-size:19px; line-height:1}
+.tb.skip{width:44px; height:44px; opacity:.85}
+.tb.skip svg{width:26px; height:26px}
+.tb.play{width:54px; height:54px}
+.tb.play svg{width:38px; height:38px}
+.tb.side{width:42px; height:42px; color:var(--dim); font-size:18px; line-height:1}
 .tb.side.on{color:var(--text)}
 .tb:active{opacity:.5}
-
 .pos{display:flex; align-items:center; gap:12px; margin-top:9px;
   font-size:12px; color:var(--faint); font-variant-numeric:tabular-nums}
 .pos input[type=range]{flex:1; accent-color:var(--play); height:4px}
 .time{min-width:92px}
 .page{min-width:56px; text-align:right; color:var(--dim); font-weight:600}
 
-/* ---- fullscreen ebook mode: controls gone, faint tap reveal ---- */
-#wrap.fullread .controls, #wrap.fullread .rtitle{ display:none; }
-#wrap.fullread .doc{ padding:34px max(18px, 6vw) 40px; }
+/* reading area below, scrolls on its own */
+.doc{flex:1; overflow-y:auto; padding:20px 20px 26px; background:var(--page);
+  color:var(--page-text); line-height:var(--lh,1.72);
+  font-size:var(--fs,21px); font-family:var(--rf); scroll-behavior:smooth;
+  -webkit-overflow-scrolling:touch}
+.sent{border-radius:8px; padding:1px 2px; scroll-margin-top:16px;
+  transition:background .12s,color .12s; cursor:pointer}
+.sent.active{background:var(--sentbg); color:var(--sentfg)}
+#wrap.focus .sent:not(.active){opacity:.30}
+.sent .w{border-radius:4px; padding:0 1px}
+.sent.active .w.cur{background:var(--wordbg); color:var(--wordfg);
+  -webkit-box-decoration-break:clone; box-decoration-break:clone}
+
+/* fullscreen ebook mode: controls gone, faint tap reveal */
+#wrap.fullread .controls{ display:none; }
+#wrap.fullread .doc{ padding:34px max(20px, 7vw) 44px; }
 .fsui{position:absolute; z-index:10; opacity:0; transition:opacity .3s;
   pointer-events:none}
 #wrap.fullread .fsui.show{opacity:1; pointer-events:auto}
@@ -165,14 +164,6 @@ html,body{margin:0}
 </head>
 <body>
 <div id="wrap">
-  <div class="rtitle" id="rtitle">__TITLE__</div>
-  <div class="doc" id="doc"></div>
-
-  <button class="fsui fsexit" id="fsExit" title="Exit fullscreen">&#10005;</button>
-  <button class="fsui fsplay" id="fsPlay" title="Play / pause">
-    <svg id="fsPlayIcon" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-  </button>
-
   <div class="controls" id="controls">
     <div class="bar">
       <button class="tb side" id="loopB" title="Loop">&#8635;</button>
@@ -193,34 +184,41 @@ html,body{margin:0}
       <span class="page" id="page">1 / 1</span>
     </div>
   </div>
+
+  <div class="doc" id="doc"></div>
+
+  <button class="fsui fsexit" id="fsExit" title="Exit fullscreen">&#10005;</button>
+  <button class="fsui fsplay" id="fsPlay" title="Play / pause">
+    <svg id="fsPlayIcon" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+  </button>
 </div>
 <audio id="au" preload="auto"></audio>
 <script>
 "use strict";
 const CLIPS = __DATA__;
 const S = Object.assign({
-  theme:"night", font:"serif", size:21, lineheight:3,
+  theme:"night", font:"sans", size:21, lineheight:3, scroll:"top",
   sentRGB:[255,217,59], wordRGB:[226,59,78], fontRGB:[255,255,255],
   speed:1.0, gap:0.0, loop:false, autoplay:false, focus:false,
   wordhl:true, offsetMs:0, volume:100
 }, __SETTINGS__);
 
 const FONTS={
+  sans:'system-ui,-apple-system,"Segoe UI",Roboto,sans-serif',
+  source:'"Source Sans 3",system-ui,sans-serif',
+  nunito:'"Nunito",system-ui,sans-serif',
+  legible:'"Atkinson Hyperlegible",system-ui,sans-serif',
+  inter:'"Inter",system-ui,sans-serif',
   serif:'Georgia,"Times New Roman",serif',
   book:'"Lora",Georgia,serif',
   garamond:'"EB Garamond",Garamond,"Times New Roman",serif',
   merri:'"Merriweather",Georgia,serif',
   slab:'"Roboto Slab",Rockwell,Georgia,serif',
-  sans:'system-ui,-apple-system,"Segoe UI",Roboto,sans-serif',
-  source:'"Source Sans 3",system-ui,sans-serif',
-  nunito:'"Nunito",system-ui,sans-serif',
-  mono:'ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace',
-  legible:'"Atkinson Hyperlegible",system-ui,sans-serif'
+  mono:'ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace'
 };
 const LH={1:1.35,2:1.5,3:1.72,4:1.95,5:2.2};
 const WORD_LEAD=0.02;
 
-/* cumulative clip offsets for whole text progress */
 const STARTS=[]; let TOTAL=0;
 CLIPS.forEach(c=>{ STARTS.push(TOTAL); TOTAL+=(c.dur||0); });
 if(TOTAL<=0) TOTAL=1;
@@ -237,13 +235,12 @@ const pageEl=document.getElementById("page");
 let idx=0, playing=false, gapTimer=null, seeking=false;
 let pendingSeek=null, pendingPlay=false;
 
-/* ---- look ---- */
 function rgb(a){return "rgb("+a[0]+","+a[1]+","+a[2]+")";}
 function pickFg(a){const l=(a[0]*299+a[1]*587+a[2]*114)/1000; return l>140?"#12140a":"#ffffff";}
 function applyLook(){
   wrap.dataset.theme=S.theme;
   wrap.classList.toggle("focus", !!S.focus);
-  doc.style.setProperty("--rf", FONTS[S.font]||FONTS.serif);
+  doc.style.setProperty("--rf", FONTS[S.font]||FONTS.sans);
   doc.style.setProperty("--fs", (S.size||21)+"px");
   doc.style.setProperty("--lh", LH[S.lineheight]||1.72);
   wrap.style.setProperty("--sentbg", rgb(S.sentRGB));
@@ -253,7 +250,6 @@ function applyLook(){
   document.getElementById("loopB").classList.toggle("on", !!S.loop);
 }
 
-/* ---- render all sentences ---- */
 function render(){
   doc.innerHTML="";
   CLIPS.forEach((c,i)=>{
@@ -265,7 +261,6 @@ function render(){
 }
 function sentEl(i){ return doc.querySelector('.sent[data-i="'+i+'"]'); }
 
-/* ---- drift corrected clock ---- */
 const CLK={pred:0,lastWall:0,lastObs:-1,ready:false};
 function clockReset(t){CLK.pred=t||0;CLK.lastWall=performance.now();CLK.lastObs=-1;CLK.ready=true;}
 function clockSample(obs,rate,run){
@@ -279,7 +274,6 @@ function clockSample(obs,rate,run){
   return CLK.pred;
 }
 
-/* ---- word highlight ---- */
 let curWord=-2, curSpans=null;
 function clearWords(){ if(curSpans){curSpans.forEach(s=>s.classList.remove("cur"));} }
 function highlight(clk){
@@ -301,7 +295,6 @@ function highlight(clk){
 
 function fmt(s){ s=Math.max(0,s|0); const m=(s/60)|0, r=s%60; return m+":"+(r<10?"0":"")+r; }
 
-/* ---- raf loop, whole text progress ---- */
 let rafId=null;
 function loop(){
   const clk=clockSample(au.currentTime, S.speed, playing && !au.paused);
@@ -315,16 +308,18 @@ function loop(){
 }
 function startLoop(){ if(!rafId) rafId=requestAnimationFrame(loop); }
 
-/* ---- load a sentence ---- */
 function setPage(){ pageEl.textContent=(idx+1)+" / "+CLIPS.length; }
+function scrollTo(el){
+  if(!el || S.scroll==="off") return;
+  el.scrollIntoView({block:(S.scroll==="center"?"center":"start"), behavior:"smooth"});
+}
 function load(i, autoplay){
   if(i<0) i=0; if(i>=CLIPS.length) i=CLIPS.length-1;
   if(gapTimer){clearTimeout(gapTimer); gapTimer=null;}
   idx=i; curWord=-2; curSpans=null;
   doc.querySelectorAll(".sent").forEach(s=>s.classList.remove("active"));
   const el=sentEl(i);
-  if(el){ el.classList.add("active");
-          el.scrollIntoView({block:"center",behavior:"smooth"}); }
+  if(el){ el.classList.add("active"); scrollTo(el); }
   au.src=CLIPS[i].audio;
   au.playbackRate=S.speed;
   au.volume=(S.volume==null?100:S.volume)/100;
@@ -333,19 +328,14 @@ function load(i, autoplay){
   if(autoplay){ au.play().catch(()=>{}); }
 }
 
-/* ---- seek across the WHOLE text ---- */
 function seekGlobal(globalTarget){
   globalTarget=Math.max(0,Math.min(TOTAL-0.01,globalTarget));
   let i=0;
   for(let k=0;k<CLIPS.length;k++){ if(globalTarget>=STARTS[k]) i=k; else break; }
   const offset=globalTarget-STARTS[i];
   const wasPlaying=playing;
-  if(i===idx){
-    au.currentTime=offset; clockReset(offset);
-  } else {
-    pendingSeek=offset; pendingPlay=wasPlaying;
-    load(i,false);
-  }
+  if(i===idx){ au.currentTime=offset; clockReset(offset); }
+  else { pendingSeek=offset; pendingPlay=wasPlaying; load(i,false); }
 }
 au.addEventListener("loadedmetadata",()=>{
   if(pendingSeek!=null){
@@ -356,12 +346,9 @@ au.addEventListener("loadedmetadata",()=>{
   }
 });
 
-/* ---- controls ---- */
 function playPause(){ if(au.paused){ au.play().catch(()=>{}); } else { au.pause(); } }
 function setPlayIcon(){
-  const p = playing
-    ? '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>'
-    : '<path d="M8 5v14l11-7z"/>';
+  const p = playing ? '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>' : '<path d="M8 5v14l11-7z"/>';
   playIcon.innerHTML=p; fsPlayIcon.innerHTML=p;
 }
 au.addEventListener("play",()=>{ playing=true; setPlayIcon(); clockReset(au.currentTime); startLoop(); });
@@ -384,14 +371,10 @@ seek.addEventListener("input",()=>{ seeking=true;
   const g=(seek.value/1000)*TOTAL; timeEl.textContent=fmt(g)+" / "+fmt(TOTAL); });
 seek.addEventListener("change",()=>{ seekGlobal((seek.value/1000)*TOTAL); seeking=false; });
 
-/* ---- fullscreen ebook mode ---- */
-function enterFS(){
-  const el=wrap;
-  (el.requestFullscreen||el.webkitRequestFullscreen||el.msRequestFullscreen||function(){}).call(el);
-}
+function enterFS(){ const el=wrap;
+  (el.requestFullscreen||el.webkitRequestFullscreen||el.msRequestFullscreen||function(){}).call(el); }
 function exitFS(){
-  (document.exitFullscreen||document.webkitExitFullscreen||document.msExitFullscreen||function(){}).call(document);
-}
+  (document.exitFullscreen||document.webkitExitFullscreen||document.msExitFullscreen||function(){}).call(document); }
 function isFS(){ return document.fullscreenElement||document.webkitFullscreenElement; }
 document.getElementById("fsB").addEventListener("click",()=>{ isFS()?exitFS():enterFS(); });
 document.getElementById("fsExit").addEventListener("click",exitFS);
@@ -400,27 +383,19 @@ function onFSChange(){
   const on=!!isFS();
   wrap.classList.toggle("fullread",on);
   document.getElementById("fsB").classList.toggle("on",on);
-  if(on) nudge(); else { fsShow(false); }
+  if(on) nudge(); else fsShow(false);
 }
 document.addEventListener("fullscreenchange",onFSChange);
 document.addEventListener("webkitfullscreenchange",onFSChange);
 
-/* faint controls that appear on tap and fade away in ebook mode */
 let fadeTimer=null;
-function fsShow(v){
-  document.querySelectorAll(".fsui").forEach(e=>e.classList.toggle("show",v));
-}
-function nudge(){
-  if(!isFS()) return;
-  fsShow(true);
-  if(fadeTimer) clearTimeout(fadeTimer);
-  fadeTimer=setTimeout(()=>fsShow(false),2600);
-}
+function fsShow(v){ document.querySelectorAll(".fsui").forEach(e=>e.classList.toggle("show",v)); }
+function nudge(){ if(!isFS()) return; fsShow(true);
+  if(fadeTimer) clearTimeout(fadeTimer); fadeTimer=setTimeout(()=>fsShow(false),2600); }
 doc.addEventListener("mousemove",nudge);
 doc.addEventListener("touchstart",nudge,{passive:true});
 doc.addEventListener("click",()=>{ if(isFS()) nudge(); });
 
-/* ---- go ---- */
 applyLook();
 render();
 load(0, !!S.autoplay);

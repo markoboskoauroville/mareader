@@ -1,82 +1,263 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v2 (a)
+EdgeReader  v8 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
 while highlighting each word in time with the voice. Word timing is measured from
-the real audio waveform with ffmpeg, the same DaVinci style engine MA Reader used.
+the real audio waveform with ffmpeg.
 
-Runs on free Streamlit Community Cloud. Because that environment is stateless and
-shared, the archive lives in your session and exports are offered as a download
-rather than written to a phone's Downloads folder.
+The interface is deliberately minimal: two tabs, Paste and Reading. You paste in
+the first, press Read, and once the voice clips are generated the app moves to the
+Reading tab on its own, where the transport sits at the top and the text flows
+below. Everything else lives in the sidebar, which starts collapsed.
+
+Look and playback settings are remembered between visits: they are saved in a
+first party browser cookie and read back on the next session.
 """
 import io
 import json
 import time
+import base64
 import zipfile
 
 import streamlit as st
 
 import engine
-from karaoke import build_player, FONT_CHOICES, FONT_KEYS
+from karaoke import build_player, FONT_CHOICES, FONT_KEYS, DEFAULT_FONT
 
 APP_NAME = "EdgeReader"
-APP_VER = "v2 (a)"
+APP_VER = "v8 (a)"
 
-st.set_page_config(page_title=APP_NAME, page_icon="\U0001F525", layout="centered")
+st.set_page_config(page_title=APP_NAME, page_icon="\U0001F4D6",
+                   layout="centered", initial_sidebar_state="collapsed")
 
-# ---------- dark chrome ----------
+# ---------- minimal dark chrome (no title, no menu clutter) ----------
 st.markdown(
     """
     <style>
       .stApp { background:#080a10; color:#cdd0d6; }
       section[data-testid="stSidebar"] { background:#0b0e15; }
-      h1,h2,h3,h4 { color:#e6e8ee; letter-spacing:.02em; }
+      [data-testid="stToolbar"] { display:none; }
+      [data-testid="stDecoration"] { display:none; }
+      footer { display:none; }
+      .block-container { padding-top:2.4rem; padding-bottom:2rem; max-width:820px; }
       .ev { position:fixed; top:8px; right:14px; font-size:11px;
-            color:#565d6e; letter-spacing:.05em; z-index:1000; }
+            color:#565d6e; letter-spacing:.06em; z-index:1000; }
+      h1,h2,h3,h4 { color:#e6e8ee; }
       .stTextArea textarea { background:#11141d; color:#cdd0d6;
-            border:1px solid #1d2230; }
+            border:1px solid #1d2230; font-size:15px; }
       div[data-baseweb="select"] > div { background:#11141d; border-color:#1d2230; }
       .stButton>button { background:#11141d; color:#cdd0d6; border:1px solid #1d2230; }
       .stButton>button:hover { border-color:#7d5cff; color:#fff; }
       .stDownloadButton>button { background:#11141d; color:#cdd0d6; border:1px solid #1d2230; }
-      .accent { color:#7d5cff; }
-      .cyan { color:#3fb9c8; }
       .muted { color:#7c8294; font-size:13px; }
     </style>
-    <div class="ev">%s %s</div>
-    """ % (APP_NAME, APP_VER),
+    <div class="ev">%s</div>
+    """ % APP_VER,
     unsafe_allow_html=True,
 )
 
-# ---------- session defaults ----------
+
+# ---------- settings persistence (first party cookie) ----------
+# Look and playback preferences are saved in a cookie so they survive a fresh
+# session on stateless Streamlit Cloud. The Gemini key is deliberately NOT saved,
+# since a cookie is readable on the device.
+PERSIST_KEYS = ["enabled_langs", "voice_id", "theme", "font", "size",
+                "lineheight", "scroll", "speed", "gap", "volume", "loop",
+                "autoplay", "focus", "wordhl", "offset_ms",
+                "sent_rgb", "word_rgb", "font_rgb"]
+COOKIE = "edgereader"
+SPEEDS = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5,
+          1.75, 2.0, 2.25, 2.5]
+
+
+def _encode_settings(d):
+    raw = json.dumps(d, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_settings(blob):
+    try:
+        pad = blob + "=" * (-len(blob) % 4)
+        return json.loads(base64.urlsafe_b64decode(pad.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _load_saved():
+    try:
+        raw = st.context.cookies.get(COOKIE)
+    except Exception:
+        raw = None
+    if not isinstance(raw, str):
+        return {}
+    return _decode_settings(raw) if raw else {}
+
+
+def persist_settings():
+    """Write current preferences to the cookie, but only when they change, so
+    the invisible writer element is emitted just on the run that changed."""
+    payload = {k: st.session_state.get(k) for k in PERSIST_KEYS}
+    blob = _encode_settings(payload)
+    if st.session_state.get("_saved_sig") == blob:
+        return
+    st.session_state["_saved_sig"] = blob
+    st.html('<script>document.cookie="%s=%s; path=/; max-age=31536000; '
+            'SameSite=Lax";</script>' % (COOKIE, blob),
+            unsafe_allow_javascript=True)
+
+
+# ---------- archive persistence (chunked cookies, holds full texts) ----------
+# The archive can carry long texts, too big for one cookie, so it is base64'd and
+# split across numbered cookies (edgereader_a0, a1, ...) with a count in
+# edgereader_ac. Oldest pieces are dropped from persistence only if the whole set
+# would exceed the cap; they stay in the session either way.
+ARCH_PREFIX = "edgereader_a"
+ARCH_COUNT = "edgereader_ac"
+ARCH_CHUNK = 3000          # base64 chars per cookie
+ARCH_MAX_CHUNKS = 10       # ~30 KB of base64, ~22 KB of text
+
+
+def _archive_blob(archive):
+    slim = [{"i": m["id"], "t": m["title"], "x": m["text"]} for m in archive]
+    raw = json.dumps(slim, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _archive_from_blob(blob):
+    try:
+        pad = blob + "=" * (-len(blob) % 4)
+        slim = json.loads(base64.urlsafe_b64decode(pad.encode("ascii")).decode("utf-8"))
+        out = []
+        for m in slim:
+            t = m.get("x", "")
+            out.append({"id": m.get("i", int(time.time() * 1000)),
+                        "title": m.get("t", "Untitled"), "text": t,
+                        "chars": len(t)})
+        return out
+    except Exception:
+        return []
+
+
+def _saved_chunk_count():
+    try:
+        v = st.context.cookies.get(ARCH_COUNT, "0")
+    except Exception:
+        return 0
+    return int(v) if isinstance(v, str) and v.isdigit() else 0
+
+
+def _load_archive():
+    n = _saved_chunk_count()
+    if n <= 0:
+        return []
+    parts = []
+    for i in range(min(n, ARCH_MAX_CHUNKS)):
+        try:
+            v = st.context.cookies.get(ARCH_PREFIX + str(i), "")
+        except Exception:
+            v = ""
+        parts.append(v if isinstance(v, str) else "")
+    return _archive_from_blob("".join(parts))
+
+
+def persist_archive():
+    """Mirror the session archive into chunked cookies, trimming the oldest
+    pieces only if the set would overflow the cap. Writes only on change."""
+    arch = list(st.session_state.archive)
+    cap = ARCH_CHUNK * ARCH_MAX_CHUNKS
+    while arch and len(_archive_blob(arch)) > cap:
+        arch = arch[:-1]                       # archive is newest first
+    blob = _archive_blob(arch)
+    if st.session_state.get("_arch_sig") == blob:
+        return
+    st.session_state["_arch_sig"] = blob
+    chunks = [blob[i:i + ARCH_CHUNK] for i in range(0, len(blob), ARCH_CHUNK)] or [""]
+    n = len(chunks)
+    prev = st.session_state.get("_arch_prevn", 0)
+    js = []
+    for i, ch in enumerate(chunks):
+        js.append('document.cookie="%s%d=%s; path=/; max-age=31536000; SameSite=Lax";'
+                   % (ARCH_PREFIX, i, ch))
+    for i in range(n, prev):                   # clear stale chunks after shrink
+        js.append('document.cookie="%s%d=; path=/; max-age=0";' % (ARCH_PREFIX, i))
+    js.append('document.cookie="%s=%d; path=/; max-age=31536000; SameSite=Lax";'
+              % (ARCH_COUNT, n))
+    st.session_state["_arch_prevn"] = n
+    st.html("<script>" + "".join(js) + "</script>", unsafe_allow_javascript=True)
+
+
+# ---------- session defaults (seeded from the saved cookie) ----------
 def _init():
     s = st.session_state
-    s.setdefault("enabled_langs", list(engine.DEFAULT_LANGS))
-    s.setdefault("voice_id", 1)
-    s.setdefault("theme", "night")
-    s.setdefault("font", "serif")
-    s.setdefault("size", 21)
-    s.setdefault("lineheight", 3)
-    s.setdefault("speed", 1.0)
-    s.setdefault("gap", 0.0)
-    s.setdefault("volume", 100)
-    s.setdefault("loop", False)
-    s.setdefault("autoplay", False)
-    s.setdefault("focus", False)
-    s.setdefault("wordhl", True)
-    s.setdefault("offset_ms", 0)
-    s.setdefault("sent_rgb", [255, 217, 59])
-    s.setdefault("word_rgb", [226, 59, 78])
-    s.setdefault("font_rgb", [255, 255, 255])
+    saved = _load_saved()
+
+    def d(key, default):        # persisted: prefer the saved value
+        s.setdefault(key, saved.get(key, default))
+
+    # non persisted, always fresh
+    s.setdefault("view", "paste")
+    s.setdefault("pastebox", "")
     s.setdefault("gemini_key", "")
     s.setdefault("clips", None)
-    s.setdefault("clips_text", "")
     s.setdefault("clips_voice", None)
     s.setdefault("clips_title", "")
-    s.setdefault("archive", [])
-    s.setdefault("pastebox", "")
+    s.setdefault("archive", _load_archive())
+    s.setdefault("_arch_prevn", _saved_chunk_count())
+    s.setdefault("offline_sig", "")
+    # translate tab
+    s.setdefault("tr_from", "auto")
+    s.setdefault("tr_to", "de")
+    s.setdefault("tx_provider", "groq")     # groq (whisper) or assemblyai
+    s.setdefault("tl_provider", "groq")     # groq or google
+    s.setdefault("tr_sex", "F")
+    s.setdefault("tr_src", "")
+    s.setdefault("tr_out", "")
+    s.setdefault("tr_clips", None)
+    s.setdefault("tr_sig", "")
+
+    # persisted look and playback
+    d("enabled_langs", list(engine.DEFAULT_LANGS))
+    d("voice_id", 1)
+    d("theme", "night")
+    d("font", DEFAULT_FONT)
+    d("size", 21)
+    d("lineheight", 3)
+    d("scroll", "top")
+    d("speed", 1.0)
+    d("gap", 0.0)
+    d("volume", 100)
+    d("loop", False)
+    d("autoplay", True)
+    d("focus", False)
+    d("wordhl", True)
+    d("offset_ms", 0)
+    d("sent_rgb", [255, 217, 59])
+    d("word_rgb", [226, 59, 78])
+    d("font_rgb", [255, 255, 255])
+
+    # validate anything a stale or hand edited cookie could get wrong
+    if s.theme not in ("night", "sepia", "day"):
+        s.theme = "night"
+    if s.font not in FONT_KEYS:
+        s.font = DEFAULT_FONT
+    if s.scroll not in ("top", "center", "off"):
+        s.scroll = "top"
+    if s.speed not in SPEEDS:
+        s.speed = 1.0
+    if not isinstance(s.enabled_langs, list) or not s.enabled_langs:
+        s.enabled_langs = list(engine.DEFAULT_LANGS)
+    else:
+        valid = {lg["key"] for lg in engine.LANGS}
+        s.enabled_langs = [k for k in s.enabled_langs if k in valid] \
+            or list(engine.DEFAULT_LANGS)
+    for k in ("sent_rgb", "word_rgb", "font_rgb"):
+        v = s.get(k)
+        if not (isinstance(v, list) and len(v) == 3
+                and all(isinstance(x, int) and 0 <= x <= 255 for x in v)):
+            s[k] = {"sent_rgb": [255, 217, 59], "word_rgb": [226, 59, 78],
+                    "font_rgb": [255, 255, 255]}[k]
 
 
 _init()
@@ -86,8 +267,7 @@ S = st.session_state
 # ---------- cached synthesis ----------
 @st.cache_data(show_spinner=False, max_entries=64)
 def _synth_cached(text, voice_edge):
-    clips, err = engine.synth_sentences(text, voice_edge)
-    return clips, err
+    return engine.synth_sentences(text, voice_edge)
 
 
 def voice_edge_of(vid):
@@ -102,18 +282,16 @@ def voice_name_of(vid):
 
 def voice_vkey_of(vid):
     v = engine.VOICES.get(vid)
-    return v[4] if v else "ukF"
+    return v[4] if v else "sansF"
 
 
 def enabled_voice_options():
-    """(labels, ids) for the picker, only for enabled languages."""
     ids, labels = [], []
     for v in engine.voices_list():
-        lang = v["lang"]
-        if lang in S.enabled_langs:
+        if v["lang"] in S.enabled_langs:
             ids.append(v["id"])
             labels.append("%s  \u00b7  %s" % (v["name"], v["label"]))
-    if not ids:  # nothing enabled: fall back to full list so a voice is pickable
+    if not ids:
         for v in engine.voices_list():
             ids.append(v["id"])
             labels.append("%s  \u00b7  %s" % (v["name"], v["label"]))
@@ -123,18 +301,168 @@ def enabled_voice_options():
 def current_settings():
     return {
         "theme": S.theme, "font": S.font, "size": S.size,
-        "lineheight": S.lineheight, "speed": S.speed, "gap": S.gap,
-        "volume": S.volume, "loop": S.loop, "autoplay": S.autoplay,
+        "lineheight": S.lineheight, "scroll": S.scroll, "speed": S.speed,
+        "gap": S.gap, "volume": S.volume, "loop": S.loop, "autoplay": S.autoplay,
         "focus": S.focus, "wordhl": S.wordhl, "offsetMs": S.offset_ms,
         "sentRGB": S.sent_rgb, "wordRGB": S.word_rgb, "fontRGB": S.font_rgb,
     }
 
 
+def title_from(text):
+    return next((ln.strip()[:60] for ln in text.splitlines() if ln.strip()),
+                "Untitled")
+
+
+def secret_keys(*array_names, numbered=None):
+    """Read API keys from Streamlit secrets. Accepts a TOML array under any of
+    array_names (or a single string), and optionally numbered singles like
+    <numbered>_1, <numbered>_2 ... stopping at the first gap. Deduped, ordered."""
+    keys = []
+    for name in array_names:
+        try:
+            v = st.secrets.get(name)
+        except Exception:
+            v = None
+        if isinstance(v, str) and v.strip():
+            keys.append(v.strip())
+        elif isinstance(v, (list, tuple)):
+            keys += [k.strip() for k in v if isinstance(k, str) and k.strip()]
+    if numbered:
+        i = 1
+        while i <= 50:
+            try:
+                kv = st.secrets.get("%s_%d" % (numbered, i))
+            except Exception:
+                kv = None
+            if isinstance(kv, str) and kv.strip():
+                keys.append(kv.strip())
+                i += 1
+            else:
+                break
+    seen, out = set(), []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def groq_keys():
+    return secret_keys("groq_keys", numbered="groq_key")
+
+
+def aai_keys():
+    return secret_keys("assemblyai_keys", numbered="assemblyai_key")
+
+
+def google_keys():
+    return secret_keys("google_keys", "gemini_keys", numbered="google_key")
+
+
+def has_groq():
+    return len(groq_keys()) > 0
+
+
+def ai_title(text):
+    """A Groq generated title for the whole text, rotating the keys. Falls back
+    to the first line if Groq is unavailable."""
+    keys = groq_keys()
+    if keys:
+        st.session_state["groq_rr"] = st.session_state.get("groq_rr", 0) + 1
+        title, _ = engine.groq_title(text, keys, start=st.session_state["groq_rr"])
+        if title:
+            return title
+    return title_from(text)
+
+
+def archive_json():
+    return json.dumps(
+        {"app": "EdgeReader", "schema": "archive/1", "exported": int(time.time()),
+         "pieces": [{"id": m["id"], "title": m["title"], "text": m["text"]}
+                    for m in st.session_state.archive]},
+        ensure_ascii=False, indent=1)
+
+
+def import_archive_json(raw):
+    """Merge pieces from an exported archive json, skipping duplicates. Returns
+    the number added."""
+    data = json.loads(raw)
+    pieces = data.get("pieces", data) if isinstance(data, dict) else data
+    if not isinstance(pieces, list):
+        return 0
+    have_ids = {m["id"] for m in st.session_state.archive}
+    have_txt = {m["text"] for m in st.session_state.archive}
+    added = 0
+    for p in pieces:
+        if not isinstance(p, dict):
+            continue
+        t = (p.get("text") or "").strip()
+        if not t or p.get("id") in have_ids or t in have_txt:
+            continue
+        pid = p.get("id") or (int(time.time() * 1000) + added)
+        st.session_state.archive.append(
+            {"id": pid, "title": p.get("title") or title_from(t),
+             "text": t, "chars": len(t)})
+        have_ids.add(pid)
+        have_txt.add(t)
+        added += 1
+    st.session_state.archive.sort(key=lambda m: m["id"], reverse=True)
+    return added
+
+
+def remember_text(text):
+    """File a pasted text into history, newest first, or move it to the top if
+    it is already there so it is never duplicated. Returns its title."""
+    t = text.strip()
+    if not t:
+        return "Untitled"
+    for m in S.archive:
+        if m["text"].strip() == t:
+            S.archive.remove(m)
+            S.archive.insert(0, m)
+            return m["title"]
+    title = ai_title(text)
+    S.archive.insert(0, {"id": int(time.time() * 1000), "title": title,
+                         "text": text, "chars": len(text)})
+    return title
+
+
+def synth_voice(text, voice_edge):
+    """Synthesise text with a specific voice (used to speak translations in the
+    target language). Returns (clips, error)."""
+    clean = engine.clean_text(text)
+    if not clean.strip():
+        return None, "Nothing to speak."
+    return _synth_cached(clean, voice_edge)
+
+
+def read_text(text, remember=False):
+    """Synthesise `text` in the current voice and, on success, switch to the
+    Reading tab. When remember is set, the text is also filed into history.
+    Returns an error string, or '' on success."""
+    clean = engine.clean_text(text)
+    if not clean.strip():
+        return "Paste some text first."
+    with st.spinner("Generating the voice, sentence by sentence, and measuring "
+                    "word timing from the audio..."):
+        clips, err = _synth_cached(clean, voice_edge_of(S.voice_id))
+    if err or not clips:
+        return err or "Nothing was produced."
+    if remember:
+        with st.spinner("Titling..." if has_groq() else ""):
+            title = remember_text(text)
+    else:
+        title = title_from(text)
+    S.clips = clips
+    S.clips_voice = S.voice_id
+    S.clips_title = title
+    S.view = "read"
+    return ""
+
+
 def build_export_zip(clips, title, vid):
-    """One EdgeReader export: manifest.json + text.txt + clips/sNNNN.mp3."""
     buf = io.BytesIO()
-    sents = []
-    duration = 0.0
+    sents, duration = [], 0.0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for c in clips:
             clip = "s%04d.mp3" % c["i"]
@@ -143,91 +471,74 @@ def build_export_zip(clips, title, vid):
                           "dur": c["dur"], "words": c["words"]})
             duration += c["dur"]
         z.writestr("text.txt", "\n".join(c["text"] for c in clips) + "\n")
-        manifest = {
+        z.writestr("manifest.json", json.dumps({
             "app": "EdgeReader", "schema": "edgereader/1",
             "title": title or "Untitled", "voice": voice_name_of(vid),
             "vkey": voice_vkey_of(vid),
             "lang": engine.VOICES[vid][2] if vid in engine.VOICES else "",
-            "created": int(time.time()),
-            "duration": round(duration, 3),
-            "sentences": sents,
-        }
-        z.writestr("manifest.json",
-                   json.dumps(manifest, ensure_ascii=False, indent=1))
+            "created": int(time.time()), "duration": round(duration, 3),
+            "sentences": sents}, ensure_ascii=False, indent=1))
     buf.seek(0)
     return buf.getvalue()
 
 
 def clips_from_zip(raw):
-    """Rebuild the player payload from an EdgeReader export zip."""
     with zipfile.ZipFile(io.BytesIO(raw)) as z:
         manifest = json.loads(z.read("manifest.json").decode("utf-8"))
         clips = []
         for sen in manifest.get("sentences", []):
-            clip = sen.get("clip", "")
-            mp3 = z.read("clips/" + clip)
             clips.append({"i": sen.get("i", 0), "text": sen.get("text", ""),
-                          "mp3": mp3, "words": sen.get("words", []),
+                          "mp3": z.read("clips/" + sen.get("clip", "")),
+                          "words": sen.get("words", []),
                           "dur": sen.get("dur", 0.0)})
     return manifest, clips
 
 
+def _clear_paste():
+    st.session_state.pastebox = ""
+
+
 # =========================================================================
-# Sidebar: voice + all settings
+# Sidebar: voice, look, playback, colours, languages, then tools
 # =========================================================================
 with st.sidebar:
-    st.markdown("### Voice")
+    st.markdown("###### Voice")
     labels, ids = enabled_voice_options()
     if S.voice_id not in ids:
         S.voice_id = ids[0]
-    sel = st.selectbox("Reading voice", labels,
-                       index=ids.index(S.voice_id), label_visibility="collapsed")
+    sel = st.selectbox("Reading voice", labels, index=ids.index(S.voice_id),
+                       label_visibility="collapsed")
     S.voice_id = ids[labels.index(sel)]
-
-    with st.expander("Languages", expanded=False):
-        st.caption("Tick a language to add its two voices to the picker.")
-        cat = engine.langs_catalogue()
-        cols = st.columns(2)
-        chosen = []
-        for n, lg in enumerate(cat):
-            with cols[n % 2]:
-                lbl = lg["label"]
-                if lg["native"]:
-                    lbl += "  (%s)" % lg["native"]
-                on = st.checkbox(lbl, value=(lg["key"] in S.enabled_langs),
-                                 key="lang_%s" % lg["key"])
-                if lg.get("uses"):
-                    st.caption("Can be used for: " + lg["uses"])
-                if on:
-                    chosen.append(lg["key"])
-        S.enabled_langs = chosen
 
     with st.expander("Reading look", expanded=True):
         S.theme = st.radio("Theme", ["night", "sepia", "day"],
                            index=["night", "sepia", "day"].index(S.theme),
                            horizontal=True)
         if S.font not in FONT_KEYS:
-            S.font = "serif"
-        font_labels = [lbl for _, lbl in FONT_CHOICES]
-        fsel = st.selectbox("Font", font_labels,
-                            index=FONT_KEYS.index(S.font))
-        S.font = FONT_KEYS[font_labels.index(fsel)]
+            S.font = DEFAULT_FONT
+        flabels = [lbl for _, lbl in FONT_CHOICES]
+        fsel = st.selectbox("Font", flabels, index=FONT_KEYS.index(S.font))
+        S.font = FONT_KEYS[flabels.index(fsel)]
         S.size = st.slider("Text size", 14, 40, S.size)
         S.lineheight = st.slider("Line spacing", 1, 5, S.lineheight)
+        scroll_opts = {"top": "Auto-scroll: keep sentence at top",
+                       "center": "Auto-scroll: keep sentence centered",
+                       "off": "Auto-scroll: off"}
+        skeys = list(scroll_opts.keys())
+        ssel = st.selectbox("Auto-scroll", [scroll_opts[k] for k in skeys],
+                            index=skeys.index(S.scroll))
+        S.scroll = skeys[[scroll_opts[k] for k in skeys].index(ssel)]
         S.focus = st.checkbox("Focus mode (dim other sentences)", S.focus)
 
     with st.expander("Playback", expanded=False):
-        speeds = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5,
-                  1.75, 2.0, 2.25, 2.5]
-        S.speed = st.select_slider("Speed", speeds, value=S.speed)
+        S.speed = st.select_slider("Speed", SPEEDS, value=S.speed)
         S.gap = st.slider("Gap between sentences (s)", 0.0, 3.0, S.gap, 0.1)
         S.volume = st.slider("Volume", 0, 100, S.volume, 5)
         S.loop = st.checkbox("Loop", S.loop)
         S.autoplay = st.checkbox("Auto-play on open", S.autoplay)
 
-    with st.expander("Highlight colours (R G B)", expanded=True):
+    with st.expander("Highlight colours (R G B)", expanded=False):
         S.wordhl = st.checkbox("Highlight the word being read", S.wordhl)
-        st.caption("Type each channel 0 to 255, as in the original reader.")
 
         def rgb_row(label, key):
             st.caption(label)
@@ -239,257 +550,335 @@ with st.sidebar:
                                   label_visibility="collapsed")
             b = c[2].number_input("B", 0, 255, v[2], key=key + "_b",
                                   label_visibility="collapsed")
-            c[3].markdown(
-                "<div style='height:34px;border-radius:6px;border:1px solid "
-                "#1d2230;background:rgb(%d,%d,%d)'></div>" % (r, g, b),
-                unsafe_allow_html=True)
+            c[3].markdown("<div style='height:34px;border-radius:6px;border:1px "
+                          "solid #1d2230;background:rgb(%d,%d,%d)'></div>"
+                          % (r, g, b), unsafe_allow_html=True)
             S[key] = [int(r), int(g), int(b)]
 
         rgb_row("Sentence highlight background", "sent_rgb")
         rgb_row("Word highlight background", "word_rgb")
         rgb_row("Highlighted word text colour", "font_rgb")
 
-        # live sample: a highlighted word inside a highlighted sentence
-        sb = S.sent_rgb
-        wb = S.word_rgb
-        wf = S.font_rgb
-        sent_fg = "#12140a" if (sb[0] * 299 + sb[1] * 587 + sb[2] * 114) / 1000 > 140 else "#ffffff"
+        sb, wb, wf = S.sent_rgb, S.word_rgb, S.font_rgb
+        sfg = "#12140a" if (sb[0]*299 + sb[1]*587 + sb[2]*114)/1000 > 140 else "#ffffff"
         st.markdown(
             "<div style='margin-top:8px;font-size:15px'>Sample: "
             "<span style='background:rgb(%d,%d,%d);color:%s;padding:2px 6px;border-radius:6px'>"
             "the <span style='background:rgb(%d,%d,%d);color:rgb(%d,%d,%d);padding:1px 4px;border-radius:4px'>word</span>"
             " being read</span></div>"
-            % (sb[0], sb[1], sb[2], sent_fg, wb[0], wb[1], wb[2], wf[0], wf[1], wf[2]),
+            % (sb[0], sb[1], sb[2], sfg, wb[0], wb[1], wb[2], wf[0], wf[1], wf[2]),
             unsafe_allow_html=True)
+        S.offset_ms = st.slider("Timing nudge (ms) \u00b7 later \u2192 earlier",
+                                -300, 300, S.offset_ms, 20)
 
-        S.offset_ms = st.slider(
-            "Timing nudge (ms) \u00b7 later \u2192 earlier", -300, 300,
-            S.offset_ms, 20)
+    with st.expander("Languages", expanded=False):
+        st.caption("Tick a language to add its two voices to the picker.")
+        cat = engine.langs_catalogue()
+        cols = st.columns(2)
+        chosen = []
+        for n, lg in enumerate(cat):
+            with cols[n % 2]:
+                lbl = lg["label"] + (("  (%s)" % lg["native"]) if lg["native"] else "")
+                if st.checkbox(lbl, value=(lg["key"] in S.enabled_langs),
+                               key="lang_%s" % lg["key"]):
+                    chosen.append(lg["key"])
+                if lg.get("uses"):
+                    st.caption("Also: " + lg["uses"])
+        S.enabled_langs = chosen
 
-    with st.expander("Gemini (optional AI titles)", expanded=False):
-        st.caption("Paste a Google Gemini API key to auto name and summarise "
-                   "archived texts. It stays in your session only.")
-        S.gemini_key = st.text_input("Gemini API key", S.gemini_key,
-                                     type="password")
-
-
-# =========================================================================
-# Header + tabs
-# =========================================================================
-st.markdown("# \U0001F525 %s" % APP_NAME)
-st.markdown("<span class='muted'>Fire the word. Paste text, it reads aloud "
-            "and highlights every word in time.</span>", unsafe_allow_html=True)
-
-tab_read, tab_archive, tab_offline, tab_help = st.tabs(
-    ["Read", "Archive", "Offline", "Help"])
-
-
-# ---------- READ ----------
-with tab_read:
-    txt = st.text_area(
-        "Paste a text to read",
-        value=S.pastebox, height=200,
-        placeholder="Paste or type anything. Links and Markdown are stripped "
-                    "automatically, so only the words are read.")
-    S.pastebox = txt
-
-    c1, c2, c3 = st.columns([1, 1, 1])
-    read_click = c1.button("Read it", type="primary", use_container_width=True)
-    save_click = c2.button("Save to archive", use_container_width=True)
-    clear_click = c3.button("Clear", use_container_width=True)
-
-    if clear_click:
-        S.pastebox = ""
-        S.clips = None
-        st.rerun()
-
-    if save_click and txt.strip():
-        title = next((ln.strip()[:60] for ln in txt.splitlines() if ln.strip()),
-                     "Untitled")
-        S.archive.insert(0, {"id": int(time.time() * 1000), "title": title,
-                             "text": txt, "chars": len(txt),
-                             "created": int(time.time()),
-                             "ai_title": "", "summary": ""})
-        st.success("Saved to archive: %s" % title)
-
-    if read_click:
-        clean = engine.clean_text(txt)
-        if not clean.strip():
-            st.warning("Paste some text first.")
-        else:
-            vedge = voice_edge_of(S.voice_id)
-            with st.spinner("Speaking sentence by sentence and measuring word "
-                            "timing from the audio..."):
-                clips, err = _synth_cached(clean, vedge)
-            if err or not clips:
-                st.error(err or "Nothing was produced.")
-            else:
-                S.clips = clips
-                S.clips_text = clean
-                S.clips_voice = S.voice_id
-                S.clips_title = next(
-                    (ln.strip()[:60] for ln in txt.splitlines() if ln.strip()),
-                    "Untitled")
+    st.markdown("---")
 
     if S.clips:
-        stale = (S.clips_voice != S.voice_id)
-        if stale:
-            st.info("Voice changed. Press Read it again to hear %s."
-                    % voice_name_of(S.voice_id))
-        eng = S.clips[0].get("engine", "edge") if S.clips else "edge"
-        src = "waveform (ffmpeg)" if eng == "pcm" else "edge word marks"
-        st.caption("%d sentences \u00b7 voice %s \u00b7 timing: %s"
-                   % (len(S.clips), voice_name_of(S.clips_voice), src))
-
-        html = build_player(S.clips, current_settings(), title=S.clips_title)
-        st.components.v1.html(html, height=650, scrolling=False)
-
-        zip_bytes = build_export_zip(S.clips, S.clips_title, S.clips_voice)
         st.download_button(
-            "Export (mp3 clips + text + manifest .zip)",
-            data=zip_bytes,
+            "Export current reading (.zip)",
+            data=build_export_zip(S.clips, S.clips_title, S.clips_voice or S.voice_id),
             file_name="%s.zip" % (S.clips_title or "edgereader"),
             mime="application/zip", use_container_width=True)
-        st.caption("The zip plays back in the Offline tab, or unzips to per "
-                   "sentence mp3 files.")
+
+    with st.expander("Offline file", expanded=False):
+        st.caption("Play back an EdgeReader export .zip without re-generating.")
+        up = st.file_uploader("Export .zip", type=["zip"],
+                              label_visibility="collapsed")
+        if up is not None:
+            sig = "%s:%d" % (up.name, up.size)
+            if sig != S.offline_sig:
+                try:
+                    manifest, clips = clips_from_zip(up.read())
+                    S.clips = clips
+                    S.clips_voice = S.voice_id
+                    S.clips_title = manifest.get("title", "Offline")
+                    S.offline_sig = sig
+                    S.view = "read"
+                    st.rerun()
+                except Exception as e:
+                    st.error("Not an EdgeReader export: %s" % e)
+
+    with st.expander("Keys and AI (secrets)", expanded=False):
+        ng, na, nk = len(groq_keys()), len(aai_keys()), len(google_keys())
+        st.caption("Loaded from secrets: Groq %d, AssemblyAI %d, Google %d."
+                   % (ng, na, nk))
+        st.caption("Groq is free and powers titles, translation, and Whisper "
+                   "transcription. AssemblyAI and Google are paid alternatives. "
+                   "Put as many keys as you like per provider; they are tried in "
+                   "order, so if one is rate limited the next is used.")
+        st.caption("On Streamlit Cloud: App, Settings, Secrets. Format:")
+        st.code(
+            'groq_keys = [\n  "gsk_key_1",\n  "gsk_key_2",\n]\n\n'
+            'assemblyai_keys = [\n  "aai_key_1",\n  "aai_key_2",\n]\n\n'
+            'google_keys = [\n  "AIza_key_1",\n  "AIza_key_2",\n]\n\n'
+            '# numbered singles also work:\n'
+            '# assemblyai_key_1 = "aai_key_1"\n'
+            '# assemblyai_key_2 = "aai_key_2"',
+            language="toml")
+
+    with st.expander("Help", expanded=False):
+        st.markdown(
+            "Paste text in the **Paste** tab and press **Read**. The app speaks "
+            "it with the words lighting up in time, and files the text in "
+            "**History** automatically. History keeps only the text, never the "
+            "audio, so any piece can be spoken again with its Read with TTS "
+            "button. History is saved in your browser and kept between visits, "
+            "and can be downloaded or imported as a file. With Groq keys in "
+            "secrets, each piece is titled automatically. The Reading tab shows "
+            "the player, with a fullscreen ebook mode.")
+
+
+# =========================================================================
+# Main area: Paste, Reading, History, Translate
+# =========================================================================
+tp, tr, th, tx = st.columns(4)
+if tp.button("Paste", use_container_width=True,
+             type="primary" if S.view == "paste" else "secondary"):
+    S.view = "paste"
+    st.rerun()
+if tr.button("Reading", use_container_width=True,
+             type="primary" if S.view == "read" else "secondary"):
+    S.view = "read"
+    st.rerun()
+hist_label = "History (%d)" % len(S.archive) if S.archive else "History"
+if th.button(hist_label, use_container_width=True,
+             type="primary" if S.view == "history" else "secondary"):
+    S.view = "history"
+    st.rerun()
+if tx.button("Translate", use_container_width=True,
+             type="primary" if S.view == "translate" else "secondary"):
+    S.view = "translate"
+    st.rerun()
+
+st.write("")
+
+if S.view == "paste":
+    st.markdown("<span class='muted'>Paste anything. Links and Markdown are "
+                "stripped, so only the words are read. Whatever you read is "
+                "saved to History automatically.</span>",
+                unsafe_allow_html=True)
+    st.text_area("Text", key="pastebox", height=280, label_visibility="collapsed",
+                 placeholder="Paste or type your text here...")
+    a, b = st.columns([2, 1])
+    if a.button("Read", type="primary", use_container_width=True):
+        err = read_text(S.pastebox, remember=True)
+        if err:
+            st.warning(err)
+        else:
+            st.rerun()
+    b.button("Clear", use_container_width=True, on_click=_clear_paste)
+
+elif S.view == "read":
+    if S.clips:
+        eng = S.clips[0].get("engine", "edge")
+        src = "waveform" if eng == "pcm" else "voice marks"
+        st.markdown("<span class='muted'>%d sentences \u00b7 %s \u00b7 timing: %s"
+                    "</span>" % (len(S.clips), voice_name_of(S.clips_voice or S.voice_id), src),
+                    unsafe_allow_html=True)
+        st.iframe(build_player(S.clips, current_settings()), height=620)
     else:
-        if not engine.ffmpeg_available():
-            st.caption("Note: ffmpeg was not found, so word timing falls back to "
-                       "the engine's own marks. Add a packages.txt with ffmpeg "
-                       "for waveform accurate timing on Streamlit Cloud.")
+        st.markdown("<span class='muted'>Nothing to read yet. Open the Paste "
+                    "tab, add some text, and press Read.</span>",
+                    unsafe_allow_html=True)
 
+elif S.view == "history":
+    st.markdown("<span class='muted'>Everything you read is kept here as text "
+                "and saved between visits. Press Read with TTS to hear any piece "
+                "again.</span>", unsafe_allow_html=True)
 
-# ---------- ARCHIVE ----------
-with tab_archive:
-    st.markdown("### Archive")
-    st.caption("Saved in this session. Open re-speaks a text in the current "
-               "voice; download from the Read tab to keep it permanently.")
-    q = st.text_input("Search", "", key="arch_q")
-    items = S.archive
-    if q.strip():
-        ql = q.lower()
-        items = [m for m in items if ql in m["title"].lower()
-                 or ql in m.get("summary", "").lower()]
-
-    if not items:
-        st.info("No saved texts yet. Paste something in Read and press "
-                "Save to archive.")
-    else:
-        if st.button("Delete all", key="arch_delall"):
+    tools = st.columns([1, 1, 1])
+    if S.archive:
+        tools[0].download_button("Download all (.json)", data=archive_json(),
+                                 file_name="edgereader-history.json",
+                                 mime="application/json", use_container_width=True)
+        if tools[2].button("Delete all", use_container_width=True):
             S.archive = []
             st.rerun()
-        for m in items:
-            with st.container(border=True):
-                head = m["title"]
-                if m.get("ai_title"):
-                    head = m["ai_title"]
-                st.markdown("**%s**" % head)
-                meta = "%d characters" % m["chars"]
-                if m.get("summary"):
-                    st.caption(m["summary"])
-                st.caption(meta)
-                cc = st.columns(4)
-                if cc[0].button("Open", key="open_%s" % m["id"]):
-                    S.pastebox = m["text"]
-                    clean = engine.clean_text(m["text"])
-                    with st.spinner("Speaking..."):
-                        clips, err = _synth_cached(clean, voice_edge_of(S.voice_id))
-                    if not err and clips:
-                        S.clips = clips
-                        S.clips_text = clean
-                        S.clips_voice = S.voice_id
-                        S.clips_title = m["title"]
-                        st.success("Loaded. Open the Read tab to play.")
-                    else:
-                        st.error(err or "Could not speak this.")
-                if cc[1].button("Delete", key="del_%s" % m["id"]):
-                    S.archive = [x for x in S.archive if x["id"] != m["id"]]
+    imp = tools[1].file_uploader("Import (.json)", type=["json"],
+                                 label_visibility="collapsed")
+    if imp is not None:
+        isig = "%s:%d" % (imp.name, imp.size)
+        if isig != S.get("imp_sig", ""):
+            S["imp_sig"] = isig
+            try:
+                n = import_archive_json(imp.read().decode("utf-8"))
+                st.success("Imported %d piece%s." % (n, "" if n == 1 else "s"))
+                if n:
                     st.rerun()
-                if S.gemini_key.strip() and cc[2].button(
-                        "AI title", key="ai_%s" % m["id"]):
-                    obj, gerr = engine.gemini_title_summary(
-                        engine.clean_text(m["text"]), S.gemini_key)
-                    if obj:
-                        for x in S.archive:
-                            if x["id"] == m["id"]:
-                                x["ai_title"] = obj["ai_title"]
-                                x["summary"] = obj["summary"]
-                        st.rerun()
-                    else:
-                        st.error(gerr or "Gemini could not summarise this.")
+            except Exception as e:
+                st.error("Could not read that file: %s" % e)
+
+    if not S.archive:
+        st.markdown("<span class='muted'>No history yet.</span>",
+                    unsafe_allow_html=True)
+    for m in list(S.archive):
+        with st.container(border=True):
+            st.markdown("**%s**  \n<span class='muted'>%d chars</span>"
+                        % (m["title"], m["chars"]), unsafe_allow_html=True)
+            a, b, c = st.columns([2, 1, 1])
+            if a.button("Read with TTS", key="rd_%s" % m["id"],
+                        type="primary", use_container_width=True):
+                err = read_text(m["text"], remember=False)
+                if err:
+                    st.error(err)
+                else:
+                    st.rerun()
+            if b.button("Title", key="ti_%s" % m["id"], use_container_width=True,
+                        disabled=not has_groq(), help="Retitle with Groq"):
+                with st.spinner("Titling..."):
+                    S["groq_rr"] = S.get("groq_rr", 0) + 1
+                    t, gerr = engine.groq_title(m["text"], groq_keys(),
+                                                start=S["groq_rr"])
+                if t:
+                    for x in S.archive:
+                        if x["id"] == m["id"]:
+                            x["title"] = t
+                    st.rerun()
+                else:
+                    st.error(gerr or "Groq could not title this.")
+            if c.button("Delete", key="dl_%s" % m["id"], use_container_width=True):
+                S.archive = [x for x in S.archive if x["id"] != m["id"]]
+                st.rerun()
+
+else:  # translate
+    LANGS_FROM = {"auto": "Auto detect", "hr": "Croatian", "en": "English",
+                  "de": "German"}
+    LANGS_TO = {"hr": "Croatian", "en": "English", "de": "German"}
+
+    st.markdown("<span class='muted'>Speak or upload audio. Transcribe it, "
+                "translate it, and hear the translation read aloud with the "
+                "words highlighted. A speech to speech translator with the text "
+                "in the middle.</span>", unsafe_allow_html=True)
+
+    lc1, lc2 = st.columns(2)
+    fk = list(LANGS_FROM)
+    S.tr_from = fk[lc1.selectbox("From", range(len(fk)),
+                                 format_func=lambda i: LANGS_FROM[fk[i]],
+                                 index=fk.index(S.tr_from))]
+    tk = list(LANGS_TO)
+    S.tr_to = tk[lc2.selectbox("To", range(len(tk)),
+                               format_func=lambda i: LANGS_TO[tk[i]],
+                               index=tk.index(S.tr_to))]
+
+    pc1, pc2 = st.columns(2)
+    tx_opts = ["Groq Whisper (free)", "AssemblyAI"]
+    tx_i = pc1.radio("Transcribe with", tx_opts,
+                     index=0 if S.tx_provider == "groq" else 1)
+    S.tx_provider = "groq" if tx_i == tx_opts[0] else "assemblyai"
+    tl_opts = ["Groq (free)", "Google"]
+    tl_i = pc2.radio("Translate with", tl_opts,
+                     index=0 if S.tl_provider == "groq" else 1)
+    S.tl_provider = "groq" if tl_i == tl_opts[0] else "google"
+
+    sx = st.radio("Spoken voice", ["Female", "Male"],
+                  index=0 if S.tr_sex == "F" else 1, horizontal=True)
+    S.tr_sex = "F" if sx == "Female" else "M"
+
+    rec = st.audio_input("Record")
+    up = st.file_uploader("or upload audio",
+                          type=["wav", "mp3", "m4a", "ogg", "webm", "flac", "aac"])
+    audio_src = rec or up
+
+    def _audio():
+        if audio_src is None:
+            return None, None
+        return audio_src.getvalue(), getattr(audio_src, "name", "recording.wav")
+
+    def _src_lang():
+        return None if S.tr_from == "auto" else S.tr_from
+
+    def do_transcribe():
+        data, name = _audio()
+        if not data:
+            st.warning("Record or upload some audio first.")
+            return None
+        with st.spinner("Transcribing with %s..."
+                        % ("AssemblyAI" if S.tx_provider == "assemblyai" else "Whisper")):
+            text, err = engine.transcribe(data, name, S.tx_provider,
+                                          groq_keys(), aai_keys(),
+                                          language=_src_lang())
+        if err or text is None:
+            st.error(err or "Transcription produced nothing.")
+            return None
+        st.session_state["tr_src"] = text
+        return text
+
+    def do_translate(text):
+        if not (text or "").strip():
+            st.warning("Nothing to translate yet.")
+            return None
+        S["groq_rr"] = S.get("groq_rr", 0) + 1
+        with st.spinner("Translating to %s with %s..."
+                        % (LANGS_TO[S.tr_to],
+                           "Google" if S.tl_provider == "google" else "Groq")):
+            out, err = engine.translate_text(text, S.tr_from, S.tr_to,
+                                             S.tl_provider, groq_keys(),
+                                             google_keys(), start=S["groq_rr"])
+        if err or not out:
+            st.error(err or "Translation produced nothing.")
+            return None
+        st.session_state["tr_out"] = out
+        return out
+
+    def do_speak(text):
+        if not (text or "").strip():
+            st.warning("Nothing to speak yet.")
+            return
+        voice = engine.voice_for_lang(S.tr_to, S.tr_sex)
+        with st.spinner("Reading the %s translation aloud..." % LANGS_TO[S.tr_to]):
+            clips, err = synth_voice(text, voice)
+        if err or not clips:
+            st.error(err or "Could not speak this.")
+            return
+        S.tr_clips = clips
+
+    b1, b2 = st.columns(2)
+    if b1.button("Transcribe", use_container_width=True):
+        do_transcribe()
+        st.rerun()
+    if b2.button("Transcribe, translate & speak", type="primary",
+                 use_container_width=True):
+        t = do_transcribe()
+        if t is not None:
+            tl = do_translate(t)
+            if tl is not None:
+                do_speak(tl)
+        st.rerun()
+
+    st.text_area("Transcript", key="tr_src", height=130,
+                 placeholder="Transcript appears here, and is editable...")
+    if st.button("Translate text", use_container_width=True):
+        do_translate(st.session_state.get("tr_src", ""))
+        st.rerun()
+
+    st.text_area("Translation", key="tr_out", height=130,
+                 placeholder="Translation appears here, and is editable...")
+    if st.button("Speak translation", type="primary", use_container_width=True):
+        do_speak(st.session_state.get("tr_out") or st.session_state.get("tr_src", ""))
+        st.rerun()
+
+    if S.tr_clips:
+        st.markdown("<span class='muted'>Translation, %d sentences, spoken in %s."
+                    "</span>" % (len(S.tr_clips), LANGS_TO[S.tr_to]),
+                    unsafe_allow_html=True)
+        st.iframe(build_player(S.tr_clips, current_settings()), height=560)
 
 
-# ---------- OFFLINE ----------
-with tab_offline:
-    st.markdown("### Offline playback")
-    st.caption("Upload an EdgeReader export .zip to play it back with the same "
-               "word highlighting, no synthesis needed.")
-    up = st.file_uploader("EdgeReader export (.zip)", type=["zip"])
-    if up is not None:
-        try:
-            manifest, clips = clips_from_zip(up.read())
-            st.caption("%s \u00b7 %d sentences \u00b7 voice %s"
-                       % (manifest.get("title", "Untitled"),
-                          len(clips), manifest.get("voice", "")))
-            html = build_player(clips, current_settings(),
-                                title=manifest.get("title", ""))
-            st.components.v1.html(html, height=650, scrolling=False)
-        except Exception as e:
-            st.error("That did not look like an EdgeReader export: %s" % e)
-
-
-# ---------- HELP ----------
-with tab_help:
-    st.markdown("### How EdgeReader works")
-    st.markdown(
-        "Paste any text in the **Read** tab and press **Read it**. EdgeReader "
-        "strips links and Markdown, splits the text into sentences, and speaks "
-        "each sentence with your chosen Microsoft Edge neural voice. As it "
-        "plays, the current sentence is highlighted and each word lights up in "
-        "time with the voice.")
-    st.markdown("### Voices and languages")
-    st.markdown(
-        "There are 13 languages, each with a female and a male neural voice, "
-        "for 26 in all. Pick which languages appear in the voice picker under "
-        "**Languages** in the sidebar. Croatian can also read Dalmatian and "
-        "\u010cakav\u0161tina, and Hindi can read Sanskrit written in "
-        "Devanagari.")
-    st.markdown("### Word timing")
-    st.markdown(
-        "Timing is measured from the audio itself. After a sentence is spoken, "
-        "EdgeReader listens to the finished clip, finds where speech really "
-        "starts, ends, and rises after each pause, and pins every word to that "
-        "waveform, the way a caption tool such as DaVinci Resolve stays glued "
-        "to speech. This needs ffmpeg, which Streamlit Cloud installs from a "
-        "packages.txt file. Without it, the engine's own word marks are used. "
-        "If the highlight feels early or late on a voice, nudge it with the "
-        "timing slider in the sidebar.")
-    st.markdown("### Export and offline")
-    st.markdown(
-        "**Export** builds a zip holding one small mp3 per sentence, the plain "
-        "text, and a manifest with the word timings. Because Streamlit Cloud is "
-        "a shared server, the zip downloads to your device rather than writing "
-        "to a Downloads folder. Re-upload that zip in the **Offline** tab to "
-        "play it back without speaking it again.")
-    st.markdown("### Archive")
-    st.markdown(
-        "Texts you save live in your browser session while the app is open. To "
-        "keep one permanently, export it. With a Gemini key you can add an AI "
-        "title and one line summary to archived texts.")
-    st.markdown("### The player")
-    st.markdown(
-        "The progress bar runs across the whole text, not one sentence, and you "
-        "can drag it to seek anywhere. Beside it the time shows elapsed and "
-        "total for the whole text, and a page counter shows the current "
-        "sentence over the total. The fullscreen button opens an ebook mode "
-        "where every control disappears and only the reading remains; a tap "
-        "brings back a faint pause and exit, and Escape leaves it.")
-    st.markdown("### Reading comfort")
-    st.markdown(
-        "Three themes (night, sepia, day), ten fonts including Lora, Garamond, "
-        "Merriweather, Roboto Slab, Nunito, and the legible Atkinson "
-        "Hyperlegible, adjustable text size and line spacing, a focus mode that "
-        "dims the sentences you are not reading, and full R G B control over "
-        "the sentence highlight background, the word highlight background, and "
-        "the highlighted word's text colour, with a live sample.")
-    st.caption("%s %s \u00b7 ported from MA Reader Web" % (APP_NAME, APP_VER))
+# ---------- remember look and playback settings, and the archive ----------
+persist_settings()
+persist_archive()
