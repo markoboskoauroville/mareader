@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v18 (a)
+EdgeReader  v19 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
@@ -28,7 +28,7 @@ import engine
 from karaoke import build_player, FONT_CHOICES, FONT_KEYS, DEFAULT_FONT
 
 APP_NAME = "EdgeReader"
-APP_VER = "v18 (a)"
+APP_VER = "v19 (a)"
 
 VIEW_OPTS = ["Read", "Translate", "History", "Player"]
 READ_PH = "Paste or type text to read..."
@@ -840,18 +840,20 @@ elif view == "History":
                 else:
                     st.rerun()
             if b.button("Title", key="ti_%s" % m["id"], use_container_width=True,
-                        disabled=not has_groq(), help="Retitle with Groq"):
+                        help="Retitle (Groq if available, else a simple title)"):
+                t = None
                 with st.spinner("Titling..."):
-                    S["groq_rr"] = S.get("groq_rr", 0) + 1
-                    t, gerr = engine.groq_title(m["text"], groq_keys(),
-                                                start=S["groq_rr"])
-                if t:
-                    for x in S.archive:
-                        if x["id"] == m["id"]:
-                            x["title"] = t
-                    st.rerun()
-                else:
-                    st.error(gerr or "Groq could not title this.")
+                    if has_groq():
+                        S["groq_rr"] = S.get("groq_rr", 0) + 1
+                        t, _ = engine.groq_title(m["text"], groq_keys(),
+                                                 start=S["groq_rr"])
+                if not t:
+                    t = title_from(m["text"])          # fallback
+                    st.toast("Groq unavailable, used a simple title.")
+                for x in S.archive:
+                    if x["id"] == m["id"]:
+                        x["title"] = t
+                st.rerun()
             if c.button("Delete", key="dl_%s" % m["id"], use_container_width=True):
                 S.archive = [x for x in S.archive if x["id"] != m["id"]]
                 st.rerun()
