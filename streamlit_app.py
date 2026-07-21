@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v15 (a)
+EdgeReader  v16 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
@@ -28,7 +28,7 @@ import engine
 from karaoke import build_player, FONT_CHOICES, FONT_KEYS, DEFAULT_FONT
 
 APP_NAME = "EdgeReader"
-APP_VER = "v15 (a)"
+APP_VER = "v16 (a)"
 
 VIEW_OPTS = ["Reading", "Transcribe & Translate", "History"]
 READ_PH = "Paste or type text to read..."
@@ -177,83 +177,18 @@ def persist_settings():
             unsafe_allow_javascript=True)
 
 
-# ---------- archive persistence (chunked cookies, holds full texts) ----------
-# The archive can carry long texts, too big for one cookie, so it is base64'd and
-# split across numbered cookies (edgereader_a0, a1, ...) with a count in
-# edgereader_ac. Oldest pieces are dropped from persistence only if the whole set
-# would exceed the cap; they stay in the session either way.
-ARCH_PREFIX = "edgereader_a"
-ARCH_COUNT = "edgereader_ac"
-ARCH_CHUNK = 3000          # base64 chars per cookie
-ARCH_MAX_CHUNKS = 10       # ~30 KB of base64, ~22 KB of text
-
-
-def _archive_blob(archive):
-    slim = [{"i": m["id"], "t": m["title"], "x": m["text"]} for m in archive]
-    raw = json.dumps(slim, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-
-def _archive_from_blob(blob):
-    try:
-        pad = blob + "=" * (-len(blob) % 4)
-        slim = json.loads(base64.urlsafe_b64decode(pad.encode("ascii")).decode("utf-8"))
-        out = []
-        for m in slim:
-            t = m.get("x", "")
-            out.append({"id": m.get("i", int(time.time() * 1000)),
-                        "title": m.get("t", "Untitled"), "text": t,
-                        "chars": len(t)})
-        return out
-    except Exception:
-        return []
-
-
-def _saved_chunk_count():
-    try:
-        v = st.context.cookies.get(ARCH_COUNT, "0")
-    except Exception:
-        return 0
-    return int(v) if isinstance(v, str) and v.isdigit() else 0
-
-
-def _load_archive():
-    n = _saved_chunk_count()
-    if n <= 0:
-        return []
-    parts = []
-    for i in range(min(n, ARCH_MAX_CHUNKS)):
-        try:
-            v = st.context.cookies.get(ARCH_PREFIX + str(i), "")
-        except Exception:
-            v = ""
-        parts.append(v if isinstance(v, str) else "")
-    return _archive_from_blob("".join(parts))
-
-
-def persist_archive():
-    """Mirror the session archive into chunked cookies, trimming the oldest
-    pieces only if the set would overflow the cap. Writes only on change."""
-    arch = list(st.session_state.archive)
-    cap = ARCH_CHUNK * ARCH_MAX_CHUNKS
-    while arch and len(_archive_blob(arch)) > cap:
-        arch = arch[:-1]                       # archive is newest first
-    blob = _archive_blob(arch)
-    if st.session_state.get("_arch_sig") == blob:
+# ---------- clean up the old oversized archive cookies ----------
+# Earlier versions stored the archive in many cookies (edgereader_a0..). On a big
+# history that overflowed the request header and nginx returned 400. Cookies are
+# no longer used for the archive; here we delete any that a returning browser
+# still carries, so it can never overflow again.
+def cleanup_legacy_cookies():
+    if st.session_state.get("_legacy_cleaned"):
         return
-    st.session_state["_arch_sig"] = blob
-    chunks = [blob[i:i + ARCH_CHUNK] for i in range(0, len(blob), ARCH_CHUNK)] or [""]
-    n = len(chunks)
-    prev = st.session_state.get("_arch_prevn", 0)
-    js = []
-    for i, ch in enumerate(chunks):
-        js.append('document.cookie="%s%d=%s; path=/; max-age=31536000; SameSite=Lax";'
-                   % (ARCH_PREFIX, i, ch))
-    for i in range(n, prev):                   # clear stale chunks after shrink
-        js.append('document.cookie="%s%d=; path=/; max-age=0";' % (ARCH_PREFIX, i))
-    js.append('document.cookie="%s=%d; path=/; max-age=31536000; SameSite=Lax";'
-              % (ARCH_COUNT, n))
-    st.session_state["_arch_prevn"] = n
+    st.session_state["_legacy_cleaned"] = True
+    js = ['document.cookie="edgereader_ac=; path=/; max-age=0";']
+    for i in range(60):
+        js.append('document.cookie="edgereader_a%d=; path=/; max-age=0";' % i)
     st.html("<script>" + "".join(js) + "</script>", unsafe_allow_javascript=True)
 
 
@@ -271,8 +206,7 @@ def _init():
     s.setdefault("clips", None)
     s.setdefault("clips_voice_name", "")
     s.setdefault("clips_title", "")
-    s.setdefault("archive", _load_archive())
-    s.setdefault("_arch_prevn", _saved_chunk_count())
+    s.setdefault("archive", [])
     s.setdefault("offline_sig", "")
     # translate tab
     d("tr_from", "auto")
@@ -769,8 +703,8 @@ with st.sidebar:
             "it with the words lighting up in time, and files the text in "
             "**History** automatically. History keeps only the text, never the "
             "audio, so any piece can be spoken again with its Read with TTS "
-            "button. History is saved in your browser and kept between visits, "
-            "and can be downloaded or imported as a file. With Groq keys in "
+            "button. History lasts for the current visit; use Download all to "
+            "keep it as a file and Import to load it back. With Groq keys in "
             "secrets, each piece is titled automatically. The Reading tab shows "
             "the player, with a fullscreen ebook mode.")
 
@@ -834,9 +768,10 @@ if view == "Reading":
         st.iframe(build_player(S.clips, current_settings()), height=620)
 
 elif view == "History":
-    st.markdown("<span class='muted'>Everything you read is kept here as text "
-                "and saved between visits. Press Read with TTS to hear any piece "
-                "again.</span>", unsafe_allow_html=True)
+    st.markdown("<span class='muted'>Everything you read is collected here as "
+                "text. Press Read with TTS to hear any piece again. History lasts "
+                "for this visit; press Download all to keep it, and Import to "
+                "load it back next time.</span>", unsafe_allow_html=True)
 
     tools = st.columns([1, 1, 1])
     if S.archive:
@@ -1012,7 +947,7 @@ else:  # translate
         st.iframe(build_player(S.tr_clips, current_settings()), height=560)
 
 
-# ---------- remember look and playback settings, and the archive ----------
+# ---------- persist settings and auth; clean up any legacy archive cookies ----------
 persist_settings()
-persist_archive()
+cleanup_legacy_cookies()
 persist_auth()
