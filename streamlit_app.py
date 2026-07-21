@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v13 (a)
+EdgeReader  v14 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
@@ -28,7 +28,7 @@ import engine
 from karaoke import build_player, FONT_CHOICES, FONT_KEYS, DEFAULT_FONT
 
 APP_NAME = "EdgeReader"
-APP_VER = "v13 (a)"
+APP_VER = "v14 (a)"
 
 VIEW_OPTS = ["Reading", "Transcribe & Translate", "History"]
 READ_PH = "Paste or type text to read..."
@@ -380,12 +380,34 @@ def shown(include_auto=True):
     return opts or (["en"] if not include_auto else ["en", "auto"])
 
 
+def detect_reading_lang(text):
+    """Resolve Auto to a language, Groq first, then heuristic, guarded so a
+    stale engine or a network hiccup can never crash the Read button."""
+    keys = groq_keys()
+    if keys and hasattr(engine, "groq_detect_lang"):
+        try:
+            code, _ = engine.groq_detect_lang(text, keys)
+            if code in ("en", "de", "hr"):
+                return code
+        except Exception:
+            pass
+    if hasattr(engine, "detect_lang"):
+        try:
+            code = engine.detect_lang(text)
+            if code in ("en", "de", "hr"):
+                return code
+        except Exception:
+            pass
+    return "en"
+
+
 def reading_voice(text):
-    """Resolve the reading language (Auto detects) and pick the voice, returning
-    (edge_voice, display_name)."""
+    """Resolve the reading language (Auto detects via Groq) and pick the voice,
+    returning (edge_voice, display_name)."""
     lang = S.read_lang
     if lang == "auto":
-        lang = engine.detect_lang(text)
+        with st.spinner("Detecting language..."):
+            lang = detect_reading_lang(text)
     edge = engine.voice_for_lang(lang, S.voice_sex)
     name = "%s %s" % (engine.lang_name(lang),
                       "female" if S.voice_sex == "F" else "male")

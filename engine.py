@@ -1088,3 +1088,63 @@ def translate_text(text, src, tgt, provider, groq_keys, google_keys, start=0):
     if provider == "google":
         return gemini_translate(text, src, tgt, google_keys, start=start)
     return groq_translate(text, src, tgt, groq_keys, start=start)
+
+
+def groq_detect_lang(text, keys, start=0):
+    """Ask Groq which language the text is (English, German, Croatian). Rotates
+    keys and models. Returns (code, error) where code is en, de, or hr."""
+    keys = [k for k in keys if isinstance(k, str) and k.strip()]
+    if not keys:
+        return None, "No Groq keys."
+    snippet = (text or "").strip()[:1500]
+    if not snippet:
+        return None, "Empty text."
+    prompt = ("Identify the language of the following text. Answer with exactly "
+              "one lowercase code and nothing else: en for English, de for "
+              "German, hr for Croatian. Pick the closest if unsure.\n\nText:\n"
+              + snippet)
+    n = len(keys)
+    order = [keys[(start + i) % n] for i in range(n)]
+    last = "Groq detection failed."
+    for key in order:
+        for model in GROQ_MODELS:
+            payload = {"model": model, "temperature": 0, "max_tokens": 4,
+                       "messages": [{"role": "user", "content": prompt}]}
+            req = urllib.request.Request(
+                GROQ_ENDPOINT, data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + key.strip()}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    obj = json.loads(r.read().decode("utf-8", "replace"))
+                out = obj["choices"][0]["message"]["content"].strip().lower()
+                for code in ("hr", "de", "en"):
+                    if code in out:
+                        return code, ""
+                last = "Groq gave an unexpected answer."
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403, 429):
+                    last = "Groq key rejected or rate limited."
+                    break
+                last = "Groq error %s." % e.code
+                continue
+            except Exception as e:
+                last = "Groq request failed: %s" % e
+                continue
+    return None, last
+
+
+def detect_language(text, groq_keys=None):
+    """Best available language detection for en/de/hr. Groq first when keys are
+    given, then the local heuristic. Never raises; defaults to en."""
+    try:
+        if groq_keys:
+            code, _ = groq_detect_lang(text, groq_keys)
+            if code in ("en", "de", "hr"):
+                return code
+    except Exception:
+        pass
+    try:
+        return detect_lang(text)
+    except Exception:
+        return "en"
