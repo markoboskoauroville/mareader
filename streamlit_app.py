@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v9 (a)
+EdgeReader  v10 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
 while highlighting each word in time with the voice. Word timing is measured from
 the real audio waveform with ffmpeg.
 
-The interface is deliberately minimal: two tabs, Paste and Reading. You paste in
-the first, press Read, and once the voice clips are generated the app moves to the
-Reading tab on its own, where the transport sits at the top and the text flows
-below. Everything else lives in the sidebar, which starts collapsed.
+The interface is deliberately minimal: three tabs, Reading, Transcribe &
+Translate, and History. The Reading tab holds the text box; you paste in it and
+press Read. The tab you last used, and all your settings, are remembered between
+visits.
 
 Look and playback settings are remembered between visits: they are saved in a
 first party browser cookie and read back on the next session.
@@ -27,7 +27,12 @@ import engine
 from karaoke import build_player, FONT_CHOICES, FONT_KEYS, DEFAULT_FONT
 
 APP_NAME = "EdgeReader"
-APP_VER = "v9 (a)"
+APP_VER = "v11 (a)"
+
+VIEW_OPTS = ["Reading", "Transcribe & Translate", "History"]
+READ_PH = "Paste or type text to read..."
+TRANS_PH = "Transcript appears here, and is editable..."
+TRANSL_PH = "Translation appears here, and is editable..."
 
 st.set_page_config(page_title=APP_NAME, page_icon="\U0001F4D6",
                    layout="centered", initial_sidebar_state="collapsed")
@@ -101,7 +106,8 @@ require_password()
 PERSIST_KEYS = ["enabled_langs", "voice_id", "theme", "font", "size",
                 "lineheight", "scroll", "speed", "gap", "volume", "loop",
                 "autoplay", "focus", "wordhl", "offset_ms",
-                "sent_rgb", "word_rgb", "font_rgb"]
+                "sent_rgb", "word_rgb", "font_rgb", "viewsel",
+                "tr_from", "tr_to", "tx_provider", "tl_provider", "tr_sex"]
 COOKIE = "edgereader"
 SPEEDS = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5,
           1.75, 2.0, 2.25, 2.5]
@@ -232,7 +238,6 @@ def _init():
         s.setdefault(key, saved.get(key, default))
 
     # non persisted, always fresh
-    s.setdefault("view", "paste")
     s.setdefault("pastebox", "")
     s.setdefault("gemini_key", "")
     s.setdefault("clips", None)
@@ -242,11 +247,11 @@ def _init():
     s.setdefault("_arch_prevn", _saved_chunk_count())
     s.setdefault("offline_sig", "")
     # translate tab
-    s.setdefault("tr_from", "auto")
-    s.setdefault("tr_to", "de")
-    s.setdefault("tx_provider", "groq")     # groq (whisper) or assemblyai
-    s.setdefault("tl_provider", "groq")     # groq or google
-    s.setdefault("tr_sex", "F")
+    d("tr_from", "auto")
+    d("tr_to", "de")
+    d("tx_provider", "groq")     # groq (whisper) or assemblyai
+    d("tl_provider", "groq")     # groq or google
+    d("tr_sex", "F")
     s.setdefault("tr_src", "")
     s.setdefault("tr_out", "")
     s.setdefault("tr_clips", None)
@@ -271,6 +276,9 @@ def _init():
     d("sent_rgb", [255, 217, 59])
     d("word_rgb", [226, 59, 78])
     d("font_rgb", [255, 255, 255])
+    d("viewsel", "Reading")
+    if s.get("viewsel") not in VIEW_OPTS:
+        s["viewsel"] = "Reading"
 
     # validate anything a stale or hand edited cookie could get wrong
     if s.theme not in ("night", "sepia", "day"):
@@ -491,8 +499,32 @@ def read_text(text, remember=False):
     S.clips = clips
     S.clips_voice = S.voice_id
     S.clips_title = title
-    S.view = "read"
+    st.session_state["_pending_view"] = "Reading"
     return ""
+
+
+def copy_paste_bar(placeholder, uid):
+    """Render Copy and Paste buttons above a text box. They act on the browser
+    clipboard client side, targeting the textarea by its placeholder."""
+    ph = json.dumps(placeholder)
+    st.html(
+        '<div style="display:flex;gap:6px;margin:2px 0 2px">'
+        '<button id="cp_%s" type="button" style="background:#11141d;color:#cdd0d6;'
+        'border:1px solid #1d2230;border-radius:8px;padding:3px 12px;font-size:12px;'
+        'cursor:pointer">Copy</button>'
+        '<button id="ps_%s" type="button" style="background:#11141d;color:#cdd0d6;'
+        'border:1px solid #1d2230;border-radius:8px;padding:3px 12px;font-size:12px;'
+        'cursor:pointer">Paste</button></div>'
+        '<script>(function(){var ph=%s;'
+        'function doc(){try{if(window.parent&&window.parent.document)return window.parent.document;}catch(e){}return document;}'
+        'function ta(){return doc().querySelector("textarea[placeholder="+JSON.stringify(ph)+"]");}'
+        'var c=document.getElementById("cp_%s"),p=document.getElementById("ps_%s");'
+        'if(c)c.addEventListener("click",function(){var t=ta();if(t&&navigator.clipboard)navigator.clipboard.writeText(t.value||"");});'
+        'if(p)p.addEventListener("click",function(){var t=ta();if(!t||!navigator.clipboard||!navigator.clipboard.readText)return;'
+        'navigator.clipboard.readText().then(function(v){var s=Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,"value").set;'
+        's.call(t,v);t.dispatchEvent(new Event("input",{bubbles:true}));t.dispatchEvent(new Event("change",{bubbles:true}));t.focus();});});'
+        '})();</script>' % (uid, uid, ph, uid, uid),
+        unsafe_allow_javascript=True)
 
 
 def build_export_zip(clips, title, vid):
@@ -643,7 +675,7 @@ with st.sidebar:
                     S.clips_voice = S.voice_id
                     S.clips_title = manifest.get("title", "Offline")
                     S.offline_sig = sig
-                    S.view = "read"
+                    st.session_state["_pending_view"] = "Reading"
                     st.rerun()
                 except Exception as e:
                     st.error("Not an EdgeReader export: %s" % e)
@@ -660,7 +692,7 @@ with st.sidebar:
         st.code(
             'groq_keys = [\n  "gsk_key_1",\n  "gsk_key_2",\n]\n\n'
             'assemblyai_keys = [\n  "aai_key_1",\n  "aai_key_2",\n]\n\n'
-            'google_keys = [\n  "AIza_key_1",\n  "AIza_key_2",\n]\n\n'
+            'google_keys = [\n  "AQ.Ab_key_1",\n  "AQ.Ab_key_2",\n]\n\n'
             '# numbered singles also work:\n'
             '# assemblyai_key_1 = "aai_key_1"\n'
             '# assemblyai_key_2 = "aai_key_2"',
@@ -668,7 +700,8 @@ with st.sidebar:
 
     with st.expander("Help", expanded=False):
         st.markdown(
-            "Paste text in the **Paste** tab and press **Read**. The app speaks "
+            "Paste or type text in the **Reading** tab and press **Read**. The "
+            "app speaks "
             "it with the words lighting up in time, and files the text in "
             "**History** automatically. History keeps only the text, never the "
             "audio, so any piece can be spoken again with its Read with TTS "
@@ -679,36 +712,26 @@ with st.sidebar:
 
 
 # =========================================================================
-# Main area: Paste, Reading, History, Translate
+# Main area: three tabs, Reading, Transcribe & Translate, History
 # =========================================================================
-tp, tr, th, tx = st.columns(4)
-if tp.button("Paste", use_container_width=True,
-             type="primary" if S.view == "paste" else "secondary"):
-    S.view = "paste"
-    st.rerun()
-if tr.button("Reading", use_container_width=True,
-             type="primary" if S.view == "read" else "secondary"):
-    S.view = "read"
-    st.rerun()
+if "_pending_view" in st.session_state:
+    st.session_state["viewsel"] = st.session_state.pop("_pending_view")
+
 hist_label = "History (%d)" % len(S.archive) if S.archive else "History"
-if th.button(hist_label, use_container_width=True,
-             type="primary" if S.view == "history" else "secondary"):
-    S.view = "history"
-    st.rerun()
-if tx.button("Translate", use_container_width=True,
-             type="primary" if S.view == "translate" else "secondary"):
-    S.view = "translate"
-    st.rerun()
+_tab_label = {"Reading": "Reading",
+              "Transcribe & Translate": "Transcribe & Translate",
+              "History": hist_label}
+st.segmented_control("mode", VIEW_OPTS, key="viewsel", required=True,
+                     width="stretch", label_visibility="collapsed",
+                     format_func=lambda v: _tab_label.get(v, v))
+view = st.session_state.get("viewsel") or "Reading"
 
 st.write("")
 
-if S.view == "paste":
-    st.markdown("<span class='muted'>Paste anything. Links and Markdown are "
-                "stripped, so only the words are read. Whatever you read is "
-                "saved to History automatically.</span>",
-                unsafe_allow_html=True)
-    st.text_area("Text", key="pastebox", height=280, label_visibility="collapsed",
-                 placeholder="Paste or type your text here...")
+if view == "Reading":
+    copy_paste_bar(READ_PH, "rd")
+    st.text_area("Reading text", key="pastebox", height=200,
+                 label_visibility="collapsed", placeholder=READ_PH)
     a, b = st.columns([2, 1])
     if a.button("Read", type="primary", use_container_width=True):
         err = read_text(S.pastebox, remember=True)
@@ -718,7 +741,6 @@ if S.view == "paste":
             st.rerun()
     b.button("Clear", use_container_width=True, on_click=_clear_paste)
 
-elif S.view == "read":
     if S.clips:
         eng = S.clips[0].get("engine", "edge")
         src = "waveform" if eng == "pcm" else "voice marks"
@@ -726,12 +748,8 @@ elif S.view == "read":
                     "</span>" % (len(S.clips), voice_name_of(S.clips_voice or S.voice_id), src),
                     unsafe_allow_html=True)
         st.iframe(build_player(S.clips, current_settings()), height=620)
-    else:
-        st.markdown("<span class='muted'>Nothing to read yet. Open the Paste "
-                    "tab, add some text, and press Read.</span>",
-                    unsafe_allow_html=True)
 
-elif S.view == "history":
+elif view == "History":
     st.markdown("<span class='muted'>Everything you read is kept here as text "
                 "and saved between visits. Press Read with TTS to hear any piece "
                 "again.</span>", unsafe_allow_html=True)
@@ -895,14 +913,14 @@ else:  # translate
                 do_speak(tl)
         st.rerun()
 
-    st.text_area("Transcript", key="tr_src", height=130,
-                 placeholder="Transcript appears here, and is editable...")
+    copy_paste_bar(TRANS_PH, "tsc")
+    st.text_area("Transcript", key="tr_src", height=130, placeholder=TRANS_PH)
     if st.button("Translate text", use_container_width=True):
         do_translate(st.session_state.get("tr_src", ""))
         st.rerun()
 
-    st.text_area("Translation", key="tr_out", height=130,
-                 placeholder="Translation appears here, and is editable...")
+    copy_paste_bar(TRANSL_PH, "tsl")
+    st.text_area("Translation", key="tr_out", height=130, placeholder=TRANSL_PH)
     if st.button("Speak translation", type="primary", use_container_width=True):
         do_speak(st.session_state.get("tr_out") or st.session_state.get("tr_src", ""))
         st.rerun()
