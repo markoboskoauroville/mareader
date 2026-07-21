@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v17 (a)
+EdgeReader  v18 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
@@ -28,7 +28,7 @@ import engine
 from karaoke import build_player, FONT_CHOICES, FONT_KEYS, DEFAULT_FONT
 
 APP_NAME = "EdgeReader"
-APP_VER = "v17 (a)"
+APP_VER = "v18 (a)"
 
 VIEW_OPTS = ["Read", "Translate", "History", "Player"]
 READ_PH = "Paste or type text to read..."
@@ -505,6 +505,20 @@ def remember_text(text):
     return title
 
 
+def export_bytes(clips):
+    """One mp3 for the whole reading. Uses the engine's ffmpeg stitcher when
+    present, otherwise falls back to a plain byte join so a stale engine.py can
+    never crash the Player."""
+    if hasattr(engine, "stitch_mp3"):
+        try:
+            out = engine.stitch_mp3(clips)
+            if out:
+                return out
+        except Exception:
+            pass
+    return b"".join(c.get("mp3", b"") for c in clips)
+
+
 def _set_clips(clips, name, title):
     S.clips = clips
     S.clips_voice_name = name
@@ -968,7 +982,7 @@ else:  # Player
 
         if S.get("stitched_bytes") is None:
             with st.spinner("Preparing the audio file..."):
-                S.stitched_bytes = engine.stitch_mp3(S.clips)
+                S.stitched_bytes = export_bytes(S.clips)
         safe = "".join(ch if ch.isalnum() or ch in " -_" else "_"
                        for ch in (S.clips_title or "edgereader"))[:50].strip() or "edgereader"
         st.download_button("Export audio (.mp3)", data=S.stitched_bytes or b"",
