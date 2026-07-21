@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v10 (a)
+EdgeReader  v12 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
@@ -19,6 +19,7 @@ import io
 import json
 import time
 import base64
+import hashlib
 import zipfile
 
 import streamlit as st
@@ -27,7 +28,7 @@ import engine
 from karaoke import build_player, FONT_CHOICES, FONT_KEYS, DEFAULT_FONT
 
 APP_NAME = "EdgeReader"
-APP_VER = "v11 (a)"
+APP_VER = "v12 (a)"
 
 VIEW_OPTS = ["Reading", "Transcribe & Translate", "History"]
 READ_PH = "Paste or type text to read..."
@@ -75,14 +76,28 @@ def _app_password():
     return "" if pw is None else str(pw)
 
 
+def _auth_token():
+    return hashlib.sha256(("edgereader::" + _app_password()).encode("utf-8")).hexdigest()
+
+
 def require_password():
     pw = _app_password()
     if not pw or st.session_state.get("_auth_ok"):
         return
+    # auto login: a browser that already entered the right password carries a
+    # matching token cookie, so it opens straight into the app
+    try:
+        tok = st.context.cookies.get("edgereader_auth")
+    except Exception:
+        tok = None
+    if isinstance(tok, str) and tok == _auth_token():
+        st.session_state["_auth_ok"] = True
+        return
     st.markdown("<div style='max-width:340px;margin:14vh auto 0'>",
                 unsafe_allow_html=True)
     st.markdown("#### \U0001F512 EdgeReader")
-    st.caption("Password protected. Enter the password to continue.")
+    st.caption("Password protected. Enter the password once and this device "
+               "stays signed in.")
     entered = st.text_input("Password", type="password", key="_pw",
                             label_visibility="collapsed", placeholder="Password")
     st.button("Enter", type="primary", use_container_width=True)
@@ -94,6 +109,19 @@ def require_password():
             st.error("Wrong password. Try again.")
     st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
+
+
+def persist_auth():
+    """Once signed in, drop a token cookie so this browser auto logs in next
+    time. Written once per session, on a normal render so it is not discarded."""
+    if not st.session_state.get("_auth_ok") or st.session_state.get("_auth_written"):
+        return
+    if not _app_password():
+        return
+    st.session_state["_auth_written"] = True
+    st.html('<script>document.cookie="edgereader_auth=%s; path=/; '
+            'max-age=31536000; SameSite=Lax";</script>' % _auth_token(),
+            unsafe_allow_javascript=True)
 
 
 require_password()
@@ -565,6 +593,18 @@ def _clear_paste():
     st.session_state.pastebox = ""
 
 
+def _reset_all():
+    """Start again: clear every text box and the current audio, keep History,
+    settings, and sign in."""
+    for k in ("pastebox", "tr_src", "tr_out"):
+        st.session_state[k] = ""
+    st.session_state["clips"] = None
+    st.session_state["clips_title"] = ""
+    st.session_state["tr_clips"] = None
+    st.session_state["offline_sig"] = ""
+    st.session_state["tr_sig"] = ""
+
+
 # =========================================================================
 # Sidebar: voice, look, playback, colours, languages, then tools
 # =========================================================================
@@ -716,6 +756,10 @@ with st.sidebar:
 # =========================================================================
 if "_pending_view" in st.session_state:
     st.session_state["viewsel"] = st.session_state.pop("_pending_view")
+
+_, xc = st.columns([5, 1])
+xc.button("\u2715", help="Clear the text boxes and current audio, start again",
+          on_click=_reset_all, use_container_width=True)
 
 hist_label = "History (%d)" % len(S.archive) if S.archive else "History"
 _tab_label = {"Reading": "Reading",
@@ -935,3 +979,4 @@ else:  # translate
 # ---------- remember look and playback settings, and the archive ----------
 persist_settings()
 persist_archive()
+persist_auth()
