@@ -862,6 +862,36 @@ def voice_for_lang(lang, sex="F"):
     return edge
 
 
+_DE_STOP = {"und", "der", "die", "das", "ist", "nicht", "ich", "sie", "mit",
+            "auf", "für", "ein", "eine", "zu", "den", "dem", "von", "auch",
+            "wird", "wie", "aber", "sind", "war", "haben", "sein", "noch"}
+_HR_STOP = {"i", "je", "na", "se", "da", "su", "za", "od", "koji", "ali", "kao",
+            "to", "sto", "nije", "sam", "biti", "ovo", "ili", "kroz", "vise",
+            "jer", "samo", "kada", "gdje", "ovaj", "bez", "nas", "vas"}
+_EN_STOP = {"the", "and", "is", "of", "to", "in", "that", "it", "for", "with",
+            "as", "are", "was", "this", "but", "not", "you", "have", "he",
+            "she", "they", "we", "at", "on", "be", "or", "an"}
+
+
+def detect_lang(text):
+    """Rough detector across English, German, Croatian for the Auto option.
+    Uses diacritics and common words. Returns 'en', 'de', or 'hr'."""
+    t = (text or "").lower()
+    if not t.strip():
+        return "en"
+    hr_chars = sum(t.count(c) for c in "\u010d\u0107\u017e\u0161\u0111")  # čćžšđ
+    de_chars = sum(t.count(c) for c in "\u00e4\u00f6\u00fc\u00df")        # äöüß
+    words = re.findall(r"[a-z\u0161\u0111\u010d\u0107\u017e\u00e4\u00f6\u00fc]+", t)
+    de = de_chars * 3 + sum(1 for w in words if w in _DE_STOP)
+    hr = hr_chars * 4 + sum(1 for w in words if w in _HR_STOP)
+    en = sum(1 for w in words if w in _EN_STOP)
+    best_lang, best = "en", en
+    for lang, score in (("de", de), ("hr", hr)):
+        if score > best:
+            best_lang, best = lang, score
+    return best_lang if best > 0 else "en"
+
+
 # ---------- multipart helper (no requests dependency) ----------
 def _multipart(fields, filename, filedata, field="file",
                content_type="application/octet-stream"):

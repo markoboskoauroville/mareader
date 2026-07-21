@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-EdgeReader  v12 (a)
+EdgeReader  v13 (a)
 
 A Streamlit port of MA Reader Web. Paste any text, pick one of 26 Microsoft Edge
 neural voices across 13 languages, and it speaks the text sentence by sentence
@@ -28,7 +28,7 @@ import engine
 from karaoke import build_player, FONT_CHOICES, FONT_KEYS, DEFAULT_FONT
 
 APP_NAME = "EdgeReader"
-APP_VER = "v12 (a)"
+APP_VER = "v13 (a)"
 
 VIEW_OPTS = ["Reading", "Transcribe & Translate", "History"]
 READ_PH = "Paste or type text to read..."
@@ -131,11 +131,11 @@ require_password()
 # Look and playback preferences are saved in a cookie so they survive a fresh
 # session on stateless Streamlit Cloud. The Gemini key is deliberately NOT saved,
 # since a cookie is readable on the device.
-PERSIST_KEYS = ["enabled_langs", "voice_id", "theme", "font", "size",
+PERSIST_KEYS = ["shown_langs", "read_lang", "voice_sex", "theme", "font", "size",
                 "lineheight", "scroll", "speed", "gap", "volume", "loop",
                 "autoplay", "focus", "wordhl", "offset_ms",
                 "sent_rgb", "word_rgb", "font_rgb", "viewsel",
-                "tr_from", "tr_to", "tx_provider", "tl_provider", "tr_sex"]
+                "tr_from", "tr_to", "tx_provider", "tl_provider"]
 COOKIE = "edgereader"
 SPEEDS = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5,
           1.75, 2.0, 2.25, 2.5]
@@ -269,7 +269,7 @@ def _init():
     s.setdefault("pastebox", "")
     s.setdefault("gemini_key", "")
     s.setdefault("clips", None)
-    s.setdefault("clips_voice", None)
+    s.setdefault("clips_voice_name", "")
     s.setdefault("clips_title", "")
     s.setdefault("archive", _load_archive())
     s.setdefault("_arch_prevn", _saved_chunk_count())
@@ -279,15 +279,15 @@ def _init():
     d("tr_to", "de")
     d("tx_provider", "groq")     # groq (whisper) or assemblyai
     d("tl_provider", "groq")     # groq or google
-    d("tr_sex", "F")
     s.setdefault("tr_src", "")
     s.setdefault("tr_out", "")
     s.setdefault("tr_clips", None)
     s.setdefault("tr_sig", "")
 
     # persisted look and playback
-    d("enabled_langs", list(engine.DEFAULT_LANGS))
-    d("voice_id", 1)
+    d("shown_langs", ["en", "de", "hr", "auto"])
+    d("read_lang", "auto")
+    d("voice_sex", "F")
     d("theme", "night")
     d("font", DEFAULT_FONT)
     d("size", 21)
@@ -317,12 +317,14 @@ def _init():
         s.scroll = "top"
     if s.speed not in SPEEDS:
         s.speed = 1.0
-    if not isinstance(s.enabled_langs, list) or not s.enabled_langs:
-        s.enabled_langs = list(engine.DEFAULT_LANGS)
-    else:
-        valid = {lg["key"] for lg in engine.LANGS}
-        s.enabled_langs = [k for k in s.enabled_langs if k in valid] \
-            or list(engine.DEFAULT_LANGS)
+    if s.voice_sex not in ("F", "M"):
+        s.voice_sex = "F"
+    allowed = ["en", "de", "hr", "auto"]
+    if not isinstance(s.shown_langs, list):
+        s.shown_langs = list(allowed)
+    s.shown_langs = [k for k in allowed if k in s.shown_langs] or list(allowed)
+    if s.read_lang not in s.shown_langs:
+        s.read_lang = s.shown_langs[0]
     for k in ("sent_rgb", "word_rgb", "font_rgb"):
         v = s.get(k)
         if not (isinstance(v, list) and len(v) == 3
@@ -335,38 +337,78 @@ _init()
 S = st.session_state
 
 
-# ---------- cached synthesis ----------
-@st.cache_data(show_spinner=False, max_entries=64)
-def _synth_cached(text, voice_edge):
-    return engine.synth_sentences(text, voice_edge)
+# ---------- synthesis with a per-sentence progress bar ----------
+@st.cache_data(show_spinner=False, max_entries=1024)
+def _synth_one_cached(sentence, voice_edge):
+    mp3, tokens, total, eng = engine.synth_one(sentence, voice_edge)
+    if mp3 is None:
+        return None
+    return {"mp3": mp3, "words": tokens, "dur": total, "engine": eng}
 
 
-def voice_edge_of(vid):
-    v = engine.VOICES.get(vid)
-    return v[0] if v else engine.VOICES[1][0]
+def synthesize(clean, voice_edge):
+    """Speak a whole text sentence by sentence, showing 'Sentence X of N'.
+    Cached per sentence, so re-reads are instant. Returns (clips, error)."""
+    sents = engine.sentences_of(clean)
+    if not sents:
+        return None, "Paste some text first."
+    n = len(sents)
+    prog = st.progress(0.0, text="Preparing the voice...")
+    clips = []
+    for i, s in enumerate(sents):
+        r = _synth_one_cached(s, voice_edge)
+        if r is None:
+            prog.empty()
+            return None, ("Sentence %d could not be generated. The voice service "
+                          "may be busy, please try again." % (i + 1))
+        clips.append({"i": i, "text": s, "mp3": r["mp3"], "words": r["words"],
+                      "dur": r["dur"], "engine": r["engine"]})
+        prog.progress((i + 1) / n, text="Sentence %d of %d" % (i + 1, n))
+    prog.empty()
+    return clips, ""
 
 
-def voice_name_of(vid):
-    v = engine.VOICES.get(vid)
-    return v[1] if v else ""
+# ---------- language quick-select model (English, German, Croatian, Auto) ----------
+LANG_LABEL = {"en": "English", "de": "German", "hr": "Croatian", "auto": "Auto"}
+LANG_ORDER = ["en", "de", "hr", "auto"]
 
 
-def voice_vkey_of(vid):
-    v = engine.VOICES.get(vid)
-    return v[4] if v else "sansF"
+def shown(include_auto=True):
+    opts = [c for c in LANG_ORDER if c in S.shown_langs]
+    if not include_auto:
+        opts = [c for c in opts if c != "auto"]
+    return opts or (["en"] if not include_auto else ["en", "auto"])
 
 
-def enabled_voice_options():
-    ids, labels = [], []
-    for v in engine.voices_list():
-        if v["lang"] in S.enabled_langs:
-            ids.append(v["id"])
-            labels.append("%s  \u00b7  %s" % (v["name"], v["label"]))
-    if not ids:
-        for v in engine.voices_list():
-            ids.append(v["id"])
-            labels.append("%s  \u00b7  %s" % (v["name"], v["label"]))
-    return labels, ids
+def reading_voice(text):
+    """Resolve the reading language (Auto detects) and pick the voice, returning
+    (edge_voice, display_name)."""
+    lang = S.read_lang
+    if lang == "auto":
+        lang = engine.detect_lang(text)
+    edge = engine.voice_for_lang(lang, S.voice_sex)
+    name = "%s %s" % (engine.lang_name(lang),
+                      "female" if S.voice_sex == "F" else "male")
+    return edge, name
+
+
+def lang_radio(label, key, include_auto=True):
+    """A horizontal radio of the shown languages, returns the chosen code."""
+    opts = shown(include_auto)
+    cur = S.get(key)
+    idx = opts.index(cur) if cur in opts else 0
+    sel = st.radio(label, opts, index=idx, horizontal=True, key="w_" + key,
+                   format_func=lambda c: LANG_LABEL[c])
+    S[key] = sel
+    return sel
+
+
+def sex_radio(widget_key):
+    sel = st.radio("Voice", ["Female", "Male"],
+                   index=0 if S.voice_sex == "F" else 1, horizontal=True,
+                   key=widget_key)
+    S.voice_sex = "F" if sel == "Female" else "M"
+    return S.voice_sex
 
 
 def current_settings():
@@ -499,24 +541,23 @@ def remember_text(text):
 
 
 def synth_voice(text, voice_edge):
-    """Synthesise text with a specific voice (used to speak translations in the
-    target language). Returns (clips, error)."""
+    """Synthesise text with a specific voice (used to speak translations).
+    Returns (clips, error)."""
     clean = engine.clean_text(text)
     if not clean.strip():
         return None, "Nothing to speak."
-    return _synth_cached(clean, voice_edge)
+    return synthesize(clean, voice_edge)
 
 
 def read_text(text, remember=False):
-    """Synthesise `text` in the current voice and, on success, switch to the
-    Reading tab. When remember is set, the text is also filed into history.
-    Returns an error string, or '' on success."""
+    """Synthesise `text` in the chosen reading language and voice, switch to the
+    Reading tab, and file it into history when remember is set. Returns an error
+    string, or '' on success."""
     clean = engine.clean_text(text)
     if not clean.strip():
         return "Paste some text first."
-    with st.spinner("Generating the voice, sentence by sentence, and measuring "
-                    "word timing from the audio..."):
-        clips, err = _synth_cached(clean, voice_edge_of(S.voice_id))
+    voice, name = reading_voice(clean)
+    clips, err = synthesize(clean, voice)
     if err or not clips:
         return err or "Nothing was produced."
     if remember:
@@ -525,37 +566,13 @@ def read_text(text, remember=False):
     else:
         title = title_from(text)
     S.clips = clips
-    S.clips_voice = S.voice_id
+    S.clips_voice_name = name
     S.clips_title = title
     st.session_state["_pending_view"] = "Reading"
     return ""
 
 
-def copy_paste_bar(placeholder, uid):
-    """Render Copy and Paste buttons above a text box. They act on the browser
-    clipboard client side, targeting the textarea by its placeholder."""
-    ph = json.dumps(placeholder)
-    st.html(
-        '<div style="display:flex;gap:6px;margin:2px 0 2px">'
-        '<button id="cp_%s" type="button" style="background:#11141d;color:#cdd0d6;'
-        'border:1px solid #1d2230;border-radius:8px;padding:3px 12px;font-size:12px;'
-        'cursor:pointer">Copy</button>'
-        '<button id="ps_%s" type="button" style="background:#11141d;color:#cdd0d6;'
-        'border:1px solid #1d2230;border-radius:8px;padding:3px 12px;font-size:12px;'
-        'cursor:pointer">Paste</button></div>'
-        '<script>(function(){var ph=%s;'
-        'function doc(){try{if(window.parent&&window.parent.document)return window.parent.document;}catch(e){}return document;}'
-        'function ta(){return doc().querySelector("textarea[placeholder="+JSON.stringify(ph)+"]");}'
-        'var c=document.getElementById("cp_%s"),p=document.getElementById("ps_%s");'
-        'if(c)c.addEventListener("click",function(){var t=ta();if(t&&navigator.clipboard)navigator.clipboard.writeText(t.value||"");});'
-        'if(p)p.addEventListener("click",function(){var t=ta();if(!t||!navigator.clipboard||!navigator.clipboard.readText)return;'
-        'navigator.clipboard.readText().then(function(v){var s=Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,"value").set;'
-        's.call(t,v);t.dispatchEvent(new Event("input",{bubbles:true}));t.dispatchEvent(new Event("change",{bubbles:true}));t.focus();});});'
-        '})();</script>' % (uid, uid, ph, uid, uid),
-        unsafe_allow_javascript=True)
-
-
-def build_export_zip(clips, title, vid):
+def build_export_zip(clips, title, voice_name):
     buf = io.BytesIO()
     sents, duration = [], 0.0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -568,9 +585,7 @@ def build_export_zip(clips, title, vid):
         z.writestr("text.txt", "\n".join(c["text"] for c in clips) + "\n")
         z.writestr("manifest.json", json.dumps({
             "app": "EdgeReader", "schema": "edgereader/1",
-            "title": title or "Untitled", "voice": voice_name_of(vid),
-            "vkey": voice_vkey_of(vid),
-            "lang": engine.VOICES[vid][2] if vid in engine.VOICES else "",
+            "title": title or "Untitled", "voice": voice_name or "",
             "created": int(time.time()), "duration": round(duration, 3),
             "sentences": sents}, ensure_ascii=False, indent=1))
     buf.seek(0)
@@ -609,14 +624,6 @@ def _reset_all():
 # Sidebar: voice, look, playback, colours, languages, then tools
 # =========================================================================
 with st.sidebar:
-    st.markdown("###### Voice")
-    labels, ids = enabled_voice_options()
-    if S.voice_id not in ids:
-        S.voice_id = ids[0]
-    sel = st.selectbox("Reading voice", labels, index=ids.index(S.voice_id),
-                       label_visibility="collapsed")
-    S.voice_id = ids[labels.index(sel)]
-
     with st.expander("Reading look", expanded=True):
         S.theme = st.radio("Theme", ["night", "sepia", "day"],
                            index=["night", "sepia", "day"].index(S.theme),
@@ -678,27 +685,12 @@ with st.sidebar:
         S.offset_ms = st.slider("Timing nudge (ms) \u00b7 later \u2192 earlier",
                                 -300, 300, S.offset_ms, 20)
 
-    with st.expander("Languages", expanded=False):
-        st.caption("Tick a language to add its two voices to the picker.")
-        cat = engine.langs_catalogue()
-        cols = st.columns(2)
-        chosen = []
-        for n, lg in enumerate(cat):
-            with cols[n % 2]:
-                lbl = lg["label"] + (("  (%s)" % lg["native"]) if lg["native"] else "")
-                if st.checkbox(lbl, value=(lg["key"] in S.enabled_langs),
-                               key="lang_%s" % lg["key"]):
-                    chosen.append(lg["key"])
-                if lg.get("uses"):
-                    st.caption("Also: " + lg["uses"])
-        S.enabled_langs = chosen
-
     st.markdown("---")
 
     if S.clips:
         st.download_button(
             "Export current reading (.zip)",
-            data=build_export_zip(S.clips, S.clips_title, S.clips_voice or S.voice_id),
+            data=build_export_zip(S.clips, S.clips_title, S.get("clips_voice_name", "")),
             file_name="%s.zip" % (S.clips_title or "edgereader"),
             mime="application/zip", use_container_width=True)
 
@@ -712,7 +704,7 @@ with st.sidebar:
                 try:
                     manifest, clips = clips_from_zip(up.read())
                     S.clips = clips
-                    S.clips_voice = S.voice_id
+                    S.clips_voice_name = manifest.get("voice", "")
                     S.clips_title = manifest.get("title", "Offline")
                     S.offline_sig = sig
                     st.session_state["_pending_view"] = "Reading"
@@ -757,7 +749,19 @@ with st.sidebar:
 if "_pending_view" in st.session_state:
     st.session_state["viewsel"] = st.session_state.pop("_pending_view")
 
-_, xc = st.columns([5, 1])
+gc, _, xc = st.columns([1, 4, 1])
+with gc.popover("\u2699", help="Choose which languages appear",
+                use_container_width=True):
+    st.caption("Show these language options as quick buttons:")
+    picked = []
+    for code in LANG_ORDER:
+        on = st.checkbox(LANG_LABEL[code] + (" (detect)" if code == "auto" else ""),
+                         value=(code in S.shown_langs), key="gear_show_%s" % code)
+        if on:
+            picked.append(code)
+    S.shown_langs = picked or ["en"]
+    if S.read_lang not in S.shown_langs:
+        S.read_lang = S.shown_langs[0]
 xc.button("\u2715", help="Clear the text boxes and current audio, start again",
           on_click=_reset_all, use_container_width=True)
 
@@ -773,7 +777,11 @@ view = st.session_state.get("viewsel") or "Reading"
 st.write("")
 
 if view == "Reading":
-    copy_paste_bar(READ_PH, "rd")
+    lc, vc = st.columns(2)
+    with lc:
+        lang_radio("Language", "read_lang", include_auto=True)
+    with vc:
+        sex_radio("sex_read")
     st.text_area("Reading text", key="pastebox", height=200,
                  label_visibility="collapsed", placeholder=READ_PH)
     a, b = st.columns([2, 1])
@@ -789,7 +797,7 @@ if view == "Reading":
         eng = S.clips[0].get("engine", "edge")
         src = "waveform" if eng == "pcm" else "voice marks"
         st.markdown("<span class='muted'>%d sentences \u00b7 %s \u00b7 timing: %s"
-                    "</span>" % (len(S.clips), voice_name_of(S.clips_voice or S.voice_id), src),
+                    "</span>" % (len(S.clips), S.get("clips_voice_name", ""), src),
                     unsafe_allow_html=True)
         st.iframe(build_player(S.clips, current_settings()), height=620)
 
@@ -853,8 +861,6 @@ elif view == "History":
                 st.rerun()
 
 else:  # translate
-    LANGS_FROM = {"auto": "Auto detect", "hr": "Croatian", "en": "English",
-                  "de": "German"}
     LANGS_TO = {"hr": "Croatian", "en": "English", "de": "German"}
 
     st.markdown("<span class='muted'>Speak or upload audio. Transcribe it, "
@@ -863,14 +869,16 @@ else:  # translate
                 "in the middle.</span>", unsafe_allow_html=True)
 
     lc1, lc2 = st.columns(2)
-    fk = list(LANGS_FROM)
-    S.tr_from = fk[lc1.selectbox("From", range(len(fk)),
-                                 format_func=lambda i: LANGS_FROM[fk[i]],
-                                 index=fk.index(S.tr_from))]
-    tk = list(LANGS_TO)
-    S.tr_to = tk[lc2.selectbox("To", range(len(tk)),
-                               format_func=lambda i: LANGS_TO[tk[i]],
-                               index=tk.index(S.tr_to))]
+    with lc1:
+        lang_radio("From", "tr_from", include_auto=True)
+    with lc2:
+        # target must be concrete so it has a voice; drop Auto
+        to_opts = shown(include_auto=False)
+        if S.tr_to not in to_opts:
+            S.tr_to = to_opts[0]
+        S.tr_to = st.radio("To", to_opts,
+                           index=to_opts.index(S.tr_to), horizontal=True,
+                           key="w_tr_to", format_func=lambda c: LANG_LABEL[c])
 
     pc1, pc2 = st.columns(2)
     tx_opts = ["Groq Whisper (free)", "AssemblyAI"]
@@ -882,9 +890,7 @@ else:  # translate
                      index=0 if S.tl_provider == "groq" else 1)
     S.tl_provider = "groq" if tl_i == tl_opts[0] else "google"
 
-    sx = st.radio("Spoken voice", ["Female", "Male"],
-                  index=0 if S.tr_sex == "F" else 1, horizontal=True)
-    S.tr_sex = "F" if sx == "Female" else "M"
+    sex_radio("sex_tr")
 
     rec = st.audio_input("Record")
     up = st.file_uploader("or upload audio",
@@ -936,7 +942,7 @@ else:  # translate
         if not (text or "").strip():
             st.warning("Nothing to speak yet.")
             return
-        voice = engine.voice_for_lang(S.tr_to, S.tr_sex)
+        voice = engine.voice_for_lang(S.tr_to, S.voice_sex)
         with st.spinner("Reading the %s translation aloud..." % LANGS_TO[S.tr_to]):
             clips, err = synth_voice(text, voice)
         if err or not clips:
@@ -957,13 +963,11 @@ else:  # translate
                 do_speak(tl)
         st.rerun()
 
-    copy_paste_bar(TRANS_PH, "tsc")
     st.text_area("Transcript", key="tr_src", height=130, placeholder=TRANS_PH)
     if st.button("Translate text", use_container_width=True):
         do_translate(st.session_state.get("tr_src", ""))
         st.rerun()
 
-    copy_paste_bar(TRANSL_PH, "tsl")
     st.text_area("Translation", key="tr_out", height=130, placeholder=TRANSL_PH)
     if st.button("Speak translation", type="primary", use_container_width=True):
         do_speak(st.session_state.get("tr_out") or st.session_state.get("tr_src", ""))
