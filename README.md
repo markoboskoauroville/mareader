@@ -53,13 +53,15 @@ translation are editable before you speak them.
 
 ## Files
 
-    streamlit_app.py     the Streamlit app (entry point)
-    engine.py            text cleaning, voices, alignment, waveform, edge-tts, Groq
-    karaoke.py           the embedded HTML/JS word highlighting player
-    requirements.txt     Python dependencies
-    packages.txt         system packages (ffmpeg) for Streamlit Cloud
-    .streamlit/config.toml          dark theme
-    .streamlit/secrets.toml.example example Groq keys, copy to secrets.toml
+```
+streamlit_app.py     the Streamlit app (entry point)
+engine.py            text cleaning, voices, alignment, waveform, edge-tts, Groq
+karaoke.py           the embedded HTML/JS word highlighting player
+requirements.txt     Python dependencies
+packages.txt         system packages (ffmpeg) for Streamlit Cloud
+.streamlit/config.toml          dark theme
+.streamlit/secrets.toml.example example Groq keys, copy to secrets.toml
+```
 
 ## AI titles with Groq (optional)
 
@@ -68,11 +70,13 @@ returns one short title. Provide your Groq keys as a TOML array. Locally, copy
 `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill it in. On
 Streamlit Community Cloud, open the app, then Settings, then Secrets, and paste:
 
-    groq_keys = [
-      "gsk_your_first_key",
-      "gsk_your_second_key",
-      "gsk_your_third_key",
-    ]
+```
+groq_keys = [
+  "gsk_your_first_key",
+  "gsk_your_second_key",
+  "gsk_your_third_key",
+]
+```
 
 Several keys are supported and rotated across requests, so if one hits a rate
 limit the next is tried. Never commit your real `secrets.toml`; it is gitignored.
@@ -91,8 +95,10 @@ which sidesteps the browser storage size limit for long term keeping.
 
 ## Run locally
 
-    pip install -r requirements.txt
-    streamlit run streamlit_app.py
+```
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
 
 For waveform accurate timing locally, install ffmpeg too (for example
 `brew install ffmpeg` on macOS or `pkg install ffmpeg` on Termux).
